@@ -1,0 +1,2 @@
+#bytes #iterations t_min[usec] t_max[usec] t_typical[usec] t_avg[usec] t_stdev[usec] 99%[usec] 99.9%[usec]
+8 10000 3.70 4.20 3.80 3.90 0.10 4.00 4.10

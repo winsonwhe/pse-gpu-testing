@@ -1,0 +1,6 @@
+50.0%  proc'd: 100 (9500 Gflop/s) - 100 (9510 Gflop/s) - 100 (9490 Gflop/s) - 100 (9500 Gflop/s)   errors: 0 - 0 - 0 - 0   temps: 61 C - 62 C - 60 C - 63 C
+100.0%  proc'd: 200 (9510 Gflop/s) - 200 (9520 Gflop/s) - 200 (9500 Gflop/s) - 200 (9510 Gflop/s)   errors: 0 - 0 - 0 - 0   temps: 60 C - 61 C - 59 C - 62 C
+GPU 0: OK
+GPU 1: OK
+GPU 2: OK
+GPU 3: OK

@@ -1,0 +1,39 @@
+{
+  "DCGM Diagnostic": {
+    "test_categories": [
+      {
+        "category": "Deployment",
+        "tests": [
+          {
+            "name": "software",
+            "test_summary": {
+              "status": "Pass"
+            },
+            "results": [
+              {
+                "entity_group": "GPU",
+                "entity_id": 0,
+                "status": "Pass"
+              },
+              {
+                "entity_group": "GPU",
+                "entity_id": 1,
+                "status": "Pass"
+              },
+              {
+                "entity_group": "GPU",
+                "entity_id": 2,
+                "status": "Pass"
+              },
+              {
+                "entity_group": "GPU",
+                "entity_id": 3,
+                "status": "Pass"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

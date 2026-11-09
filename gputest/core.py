@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import datetime
-import json
+import os
+import shlex
 import subprocess
-import sys
-import textwrap
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import yaml
+
+from gputest.reporting import (
+    annotate,
+    apply_baseline,
+    print_summary,
+    write_json,
+    write_markdown,
+)
+
+__all__ = ['print_summary', 'write_json', 'write_markdown']
 
 # ---------------------------------------------------------------------------
 # Result
@@ -29,6 +40,8 @@ class Result:
     raw_output_file: str | None = None
     # internal: raw text kept in memory until written
     _raw: str = field(default="", repr=False)
+    thresholds: list[dict] = field(default_factory=list)
+    hints: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.status not in VALID_STATUSES:
@@ -94,6 +107,10 @@ class RunContext:
     dry_run: bool = False
     mock: bool = False
     network_mode: str = "single_plane"
+    baseline: str | None = None
+    baseline_file: Path = field(default_factory=lambda: Path("baseline.json"))
+    node_count: int | None = None
+    target_node: str | None = None
     results_dir: Path = field(default_factory=lambda: Path("results/current"))
 
     def run(
@@ -104,27 +121,66 @@ class RunContext:
         sudo: bool = False,
         timeout: int = 120,
         mock_fixture: str | None = None,
+        cwd: str | Path | None = None,
+        env: dict[str, str] | None = None,
     ) -> RunResult:
         return run(
             cmd,
-            node=node,
+            node=node or self.target_node,
             sudo=sudo,
             timeout=timeout,
             dry_run=self.dry_run,
             mock=self.mock,
             mock_fixture=mock_fixture,
             results_dir=self.results_dir,
+            cwd=cwd,
+            env=env,
+            ssh_tool=self.config.get("tools", {}).get("ssh", "ssh"),
+            remote_timeout_tool=self.config.get("tools", {}).get("timeout", "timeout"),
         )
+
+    def run_parallel(self, jobs: list[dict]) -> list[RunResult]:
+        """Bounded parallel local/SSH calls; dry-run output stays in input order."""
+        if self.dry_run:
+            return [self.run(**job) for job in jobs]
+        workers = self.config.get("executor", {}).get("parallelism", 16)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(lambda job: self.run(**job), jobs))
+
+    def run_pair(self, server: dict, client: dict, port: int) -> tuple[RunResult, RunResult]:
+        """Start a bounded server; inspect its listening socket without consuming it."""
+        cfg = self.config["rdma_perf"]
+        ready = {"cmd": [self.config["tools"]["ss"], "-H", "-ltn", "sport", "=", f":{port}"],
+                     "node": server["node"], "timeout": cfg["probe_timeout_s"],
+                     "mock_fixture": "rdma_listen.txt"}
+        if self.dry_run:
+            sr = self.run(**server)
+            self.run(**ready)
+            return sr, self.run(**client)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.run, **server)
+            for _ in range(cfg["ready_attempts"]):
+                probe = self.run(**ready)
+                if probe.returncode == 0 and probe.stdout.strip():
+                    break
+                if future.done():
+                    return future.result(), RunResult("", "server exited before listening", 1, 0)
+                Event().wait(cfg["ready_interval_s"])
+            else:
+                return future.result(), RunResult("", "server readiness timed out", 1, 0)
+            client_result = self.run(**client)
+            return future.result(), client_result
+
+    def burn_duration_s(self):
+        profile = self.config.get('_profile', 'standard').removeprefix('a10_')
+        return self.config['profile_settings'][profile]['burn_duration_s']
 
     def sku_config(self) -> dict:
         return self.config.get("skus", {}).get(self.sku, {})
 
     def network_config(self) -> dict:
-        return (
-            self.config.get("network", {})
-            .get(self.network_mode, {})
-            .get(self.sku, {})
-        )
+        mode = self.config.get("network", {}).get(self.network_mode, {})
+        return {**mode, **mode.get(self.sku, {})}
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +197,10 @@ def run(
     mock: bool = False,
     mock_fixture: str | None = None,
     results_dir: Path | None = None,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+    remote_timeout_tool: str = "timeout",
+    ssh_tool: str = "ssh",
 ) -> RunResult:
     """
     Execute a command, save its output, return a RunResult.
@@ -150,24 +210,40 @@ def run(
     - node: SSH to that host.
     - sudo: prepend sudo.
     """
+    fixture_command = cmd[0]
     if sudo:
-        cmd = ["sudo"] + cmd
+        cmd = ["sudo", "-n"] + cmd
     if node:
-        cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", node] + cmd
+        if node.startswith("-") or any(c.isspace() for c in node):
+            raise ValueError("invalid SSH host")
+        remote = [remote_timeout_tool, "--signal=TERM", "--kill-after=5", str(timeout)]
+        if env:
+            remote += ["env"] + [f"{k}={v}" for k, v in env.items()]
+        remote += cmd
+        script = shlex.join(remote)
+        if cwd:
+            script = f"cd {shlex.quote(str(cwd))} && {script}"
+        cmd = [ssh_tool, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", node, script]
+        cwd, env = None, None
 
     if dry_run:
-        print(f"[dry-run] {' '.join(cmd)}")
+        prefix = f"cd {shlex.quote(str(cwd))} && " if cwd else ""
+        assignments = ' '.join(f'{k}={shlex.quote(v)}' for k, v in (env or {}).items())
+        print(f"[dry-run] {prefix}{assignments + ' ' if assignments else ''}{shlex.join(cmd)}")
         return RunResult(stdout="", stderr="", returncode=0, elapsed_s=0.0, skipped=True)
 
     if mock:
-        fixture = mock_fixture or (cmd[0] if not node else cmd[6])
-        fixture_path = Path("fixtures") / fixture
+        fixture = mock_fixture or fixture_command
+        fixture_root = Path(__file__).resolve().parent.parent / "fixtures"
+        fixture_path = fixture_root / fixture
         if not fixture_path.exists():
-            fixture_path = Path("fixtures") / (fixture + ".txt")
+            fixture_path = fixture_root / (fixture + ".txt")
         if fixture_path.exists():
             stdout = fixture_path.read_text()
         else:
-            stdout = ""
+            error = f'mock fixture unavailable: {fixture}'
+            _save_raw(cmd, '', error, results_dir)
+            return RunResult('', error, 127, 0)
         rr = RunResult(stdout=stdout, stderr="", returncode=0, elapsed_s=0.0)
         _save_raw(cmd, stdout, "", results_dir)
         return rr
@@ -181,6 +257,8 @@ def run(
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=cwd,
+            env={**os.environ, **env} if env else None,
         )
         elapsed = time.monotonic() - t0
         _save_raw(cmd, proc.stdout, proc.stderr, results_dir)
@@ -190,15 +268,49 @@ def run(
             returncode=proc.returncode,
             elapsed_s=elapsed,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - t0
         msg = f"[timeout after {timeout}s]"
-        _save_raw(cmd, msg, "", results_dir)
-        return RunResult(stdout=msg, stderr="", returncode=-1, elapsed_s=elapsed)
+        stdout = exc.stdout or b""
+        stderr = exc.stderr or b""
+        stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
+        stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+        _save_raw(cmd, stdout, stderr + msg, results_dir)
+        return RunResult(stdout=stdout, stderr=stderr + msg, returncode=-1, elapsed_s=elapsed)
     except FileNotFoundError:
         _save_raw(cmd, "", f"command not found: {cmd[0]}", results_dir)
         return RunResult(stdout="", stderr=f"command not found: {cmd[0]}",
                          returncode=127, elapsed_s=0.0)
+
+
+def run_sampled(ctx, cmd, *, timeout, fixture, cwd=None, env=None):
+    """Run a workload while issuing bounded nvidia-smi samples through run()."""
+    cfg = ctx.config['gpu_burn']
+    sample_cmd = [ctx.config['tools']['nvidia_smi'],
+                  '--query-gpu=index,temperature.gpu,power.draw',
+                  '--format=csv,noheader,nounits']
+    samples, errors = [], []
+    stop = Event()
+
+    def sample():
+        while True:
+            rr = ctx.run(sample_cmd, timeout=cfg['sample_timeout_s'],
+                         mock_fixture='gpu_samples.txt')
+            samples.append(rr.stdout)
+            if rr.returncode:
+                errors.append('temperature/power sampling unavailable: ' + rr.stderr.strip())
+                break
+            if ctx.mock or ctx.dry_run or stop.wait(cfg['sample_interval_s']):
+                break
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        sampler = pool.submit(sample)
+        try:
+            rr = ctx.run(cmd, timeout=timeout, mock_fixture=fixture, cwd=cwd, env=env)
+        finally:
+            stop.set()
+        sampler.result()
+    return rr, '\n'.join(samples), '; '.join(errors)
 
 
 def _save_raw(cmd: list[str], stdout: str, stderr: str, results_dir: Path | None):
@@ -242,7 +354,7 @@ def run_checks(
     for name in checks:
         entry = registry.get(name)
         if not entry:
-            results.append(Result(name=name, status="SKIP", message="check not found in registry"))
+            results.append(Result(name=name, status="FAIL", message="check not found in registry"))
             continue
 
         # SKU filter
@@ -261,106 +373,52 @@ def run_checks(
             ))
             continue
 
+        if entry['category'] != 'preflight' and any(
+                r.name == 'network_mode' and r.status == 'FAIL' for r in results):
+            results.append(Result(name, 'SKIP', 'blocked by failed network_mode preflight'))
+            continue
         try:
-            result = entry["fn"](ctx)
+            # Workloads/preflights run on every requested host. Coordinating checks
+            # already consume ctx.nodes and must run only once.
+            if ctx.nodes and not entry['multi_host'] and name not in ('network_mode', 'rdma_iface') and not (
+                    name == 'nvbandwidth' and ctx.config['nvbandwidth']['multinode']):
+                def run_host(item, check_name=name):
+                    index, node = item
+                    child = replace(ctx, nodes=[], target_node=node, baseline=None,
+                                    results_dir=ctx.results_dir / f'host-{index}')
+                    return run_checks([check_name], child)[0]
+
+                if ctx.dry_run:
+                    host_results = list(map(run_host, enumerate(ctx.nodes)))
+                else:
+                    with ThreadPoolExecutor(max_workers=ctx.config['executor']['parallelism']) as pool:
+                        host_results = list(pool.map(run_host, enumerate(ctx.nodes)))
+                status = max((r.status for r in host_results), key=['PASS', 'SKIP', 'WARN', 'FAIL'].index)
+                result = Result(name, status, '; '.join(f'{n}: {r.message}' for n, r in zip(ctx.nodes, host_results)),
+                                {'nodes': ctx.nodes, 'hosts': {n: r.metrics for n, r in zip(ctx.nodes, host_results)}},
+                                _raw='\n'.join(f'{n}: {r.status}\n{r._raw}' for n, r in zip(ctx.nodes, host_results)))
+                result.thresholds = [dict(t, host=n) for n, r in zip(ctx.nodes, host_results) for t in r.thresholds]
+                result.hints = list(dict.fromkeys(h for r in host_results for h in r.hints))
+                if all(r.metrics.get('uncalibrated') for r in host_results):
+                    result.metrics['uncalibrated'] = True
+            else:
+                result = entry["fn"](ctx)
         except (RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
             result = Result(name=name, status="FAIL", message=f"exception: {exc}")
 
+        if result._raw and not ctx.dry_run:
+            ctx.results_dir.mkdir(parents=True, exist_ok=True)
+            path = ctx.results_dir / f"{name}.txt"
+            path.write_text(result._raw)
+            result.raw_output_file = str(path.resolve())
         results.append(result)
 
+    for result in results:
+        if not result.thresholds:
+            annotate(result, ctx)
+    apply_baseline(results, ctx)
+    for result in results:
+        if result.status in ('WARN', 'FAIL'):
+            result.hints = list(dict.fromkeys(result.hints + ctx.config['troubleshooting'].get(
+                result.name, ctx.config['troubleshooting']['default'])))
     return results
-
-
-# ---------------------------------------------------------------------------
-# Report writer
-# ---------------------------------------------------------------------------
-
-_STATUS_ICON = {"PASS": "[PASS]", "WARN": "[WARN]", "FAIL": "[FAIL]", "SKIP": "[SKIP]"}
-_STATUS_COLOR = {
-    "PASS": "\033[32m",  # green
-    "WARN": "\033[33m",  # yellow
-    "FAIL": "\033[31m",  # red
-    "SKIP": "\033[90m",  # dark grey
-}
-_RESET = "\033[0m"
-
-
-def _color(status: str, text: str) -> str:
-    if not sys.stdout.isatty():
-        return text
-    return f"{_STATUS_COLOR.get(status, '')}{text}{_RESET}"
-
-
-def print_summary(results: list[Result]) -> None:
-    counts = {s: 0 for s in VALID_STATUSES}
-    for r in results:
-        icon = _STATUS_ICON.get(r.status, r.status)
-        line = f"{icon} {r.name:<30} {r.message}"
-        print(_color(r.status, line))
-        counts[r.status] += 1
-    print("-" * 60)
-    parts = [f"{counts[s]} {s}" for s in ("PASS", "FAIL", "WARN", "SKIP")]
-    print("  ".join(parts))
-
-
-def write_json(results: list[Result], run_meta: dict, out_dir: Path) -> Path:
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "results.json"
-
-    payload = {
-        **run_meta,
-        "checks": [
-            {
-                "name": r.name,
-                "status": r.status,
-                "message": r.message,
-                "metrics": r.metrics,
-                "raw_output_file": r.raw_output_file,
-            }
-            for r in results
-        ],
-    }
-    path.write_text(json.dumps(payload, indent=2))
-    return path
-
-
-def write_markdown(results: list[Result], run_meta: dict, out_dir: Path) -> Path:
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "results.md"
-
-    lines = [
-        f"# gpuval run — {run_meta.get('run_id', '')}",
-        "",
-        f"- **SKU**: {run_meta.get('sku', '')}",
-        f"- **Network mode**: {run_meta.get('network_mode', '')}",
-        f"- **Nodes**: {', '.join(run_meta.get('nodes', ['localhost']))}",
-        f"- **Profile**: {run_meta.get('profile', '')}",
-        "",
-        "| Check | Status | Message |",
-        "|---|---|---|",
-    ]
-    for r in results:
-        lines.append(f"| {r.name} | {r.status} | {r.message} |")
-
-    lines.append("")
-
-    for r in results:
-        lines.append(f"## {r.name} — {r.status}")
-        if r.metrics:
-            lines.append("")
-            lines.append("| Key | Value |")
-            lines.append("|---|---|")
-            for k, v in r.metrics.items():
-                lines.append(f"| {k} | {v} |")
-        if r.raw_output_file and Path(r.raw_output_file).exists():
-            raw = Path(r.raw_output_file).read_text()
-            lines.append("")
-            lines.append("```")
-            lines.append(textwrap.shorten(raw, width=4000, placeholder="\n...(truncated)"))
-            lines.append("```")
-        lines.append("")
-
-    path.write_text("\n".join(lines))
-    return path

@@ -1,0 +1,7 @@
+Running benchmark
+Function    Best(GB/s)  Avg time     Min time     Max time
+Copy:       950.12      0.0843       0.0842       0.0844
+Mul:        951.45      0.0841       0.0840       0.0842
+Add:        950.78      0.0842       0.0841       0.0843
+Triad:      949.56      0.0843       0.0842       0.0844
+Dot:        125.34      0.0256       0.0255       0.0257

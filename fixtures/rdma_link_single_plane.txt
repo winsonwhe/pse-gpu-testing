@@ -1,0 +1,3 @@
+link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev rdma0
+link mlx5_1/1 state ACTIVE physical_state LINK_UP netdev rdma1
+link mlx5_2/1 state DOWN physical_state POLLING netdev eth0

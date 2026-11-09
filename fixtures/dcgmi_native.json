@@ -1,0 +1,16 @@
+{
+  "DCGM Diagnostic": {
+    "test_categories": [{
+      "category": "Hardware",
+      "tests": [
+        {"name": "memory", "test_summary": {"status": "Pass"},
+         "results": [{"entity_group": "GPU", "entity_id": 0, "status": "Pass"}]},
+        {"name": "pcie", "test_summary": {"status": "Warn"},
+         "results": [{"entity_group": "GPU", "entity_id": 0, "status": "Warn",
+                      "warnings": [{"warning": "Bandwidth below configured minimum"}]}]},
+        {"name": "targeted stress", "test_summary": {"status": "Fail"},
+         "results": [{"entity_group": "GPU", "entity_id": 1, "status": "Fail"}]}
+      ]
+    }]
+  }
+}

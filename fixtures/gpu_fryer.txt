@@ -1,0 +1,9 @@
+GPU #0:  51494 Gflops/s (min: 50577.53, max: 51677.05, dev: 51493.79)
+         Temperature: 48.83°C (min: 47.00, max: 50.00)
+GPU #1:  51494 Gflops/s (min: 50577.53, max: 51677.05, dev: 51493.79)
+         Temperature: 48.83°C (min: 47.00, max: 50.00)
+GPU #2:  51494 Gflops/s (min: 50577.53, max: 51677.05, dev: 51493.79)
+         Temperature: 48.83°C (min: 47.00, max: 50.00)
+GPU #3:  51494 Gflops/s (min: 50577.53, max: 51677.05, dev: 51493.79)
+         Temperature: 48.83°C (min: 47.00, max: 50.00)
+All GPUs seem healthy

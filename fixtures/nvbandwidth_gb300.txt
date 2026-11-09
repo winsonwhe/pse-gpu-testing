@@ -1,0 +1,3 @@
+nvbandwidth offline format example (not a hardware measurement)
+Running device_to_device_bidirectional_memcpy_read_ce.
+SUM device_to_device_bidirectional_memcpy_read_ce 9500.00

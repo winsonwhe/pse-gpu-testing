@@ -1,0 +1,4 @@
+link rdma_vf_rail0/1 state ACTIVE physical_state LINK_UP netdev rdma_vf_rail0
+link rdma_vf_rail1/1 state ACTIVE physical_state LINK_UP netdev rdma_vf_rail1
+link rdma_vf_rail2/1 state ACTIVE physical_state LINK_UP netdev rdma_vf_rail2
+link rdma_vf_rail3/1 state ACTIVE physical_state LINK_UP netdev rdma_vf_rail3

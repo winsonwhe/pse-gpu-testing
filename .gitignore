@@ -1,0 +1,11 @@
+docs/NRT B300 singleplanar handover-20261005.pdf
+docs/BM.GPU.GB300.4_Single_Plane_Asset_handover_manual.pdf
+docs/GB300.4_multiplanar_handover_manual_from_PSE.pdf
+.DS_Store
+
+# Generated Python, validation output and cloned benchmark sources
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+results/
+tools/

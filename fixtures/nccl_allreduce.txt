@@ -1,0 +1,9 @@
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
+# Truncated  smaller message sizes
+  8589934592    2147483648     float     sum      -1    17930  479.07  838.38      0    17928  479.15  838.50      0
+ 17179869184    4294967296     float     sum      -1    35722  480.93  841.63      0    35702  481.21  842.11      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 474.234
+#

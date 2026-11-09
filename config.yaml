@@ -1,16 +1,27 @@
 profiles:
-  quick:    [nvidia_smi]
-  standard: [nvidia_smi, fabricmanager, numa_topology, rdma_link, dcgm_r1, gpu_fryer,
-             nvbandwidth, ssh_connectivity, rdma_bw, nccl_allreduce]
-  full:     [nvidia_smi, fabricmanager, numa_topology, rdma_link, wpa_supplicant,
-             dcgm_r1, dcgm_r3, dcgm_r4, gpu_fryer, nvbandwidth, babelstream,
-             ssh_connectivity, rdma_bw, rdma_lat, nccl_allreduce, nccl_alltoall, imex]
-  a10_quick:    [nvidia_smi]
-  a10_standard: [nvidia_smi, numa_topology, rdma_link, dcgm_r1, nvbandwidth,
-                 ssh_connectivity, rdma_bw, nccl_allreduce]
-  a10_full:     [nvidia_smi, numa_topology, rdma_link, dcgm_r1, dcgm_r3, dcgm_r4,
-                 nvbandwidth, babelstream, ssh_connectivity, rdma_bw, rdma_lat,
-                 nccl_allreduce, nccl_alltoall]
+  quick: &quick [network_mode, nvidia_smi, gpu_topology, fabricmanager, numa_topology,
+                  rdma_iface, gpu_burn]
+  standard: &standard [network_mode, nvidia_smi, gpu_topology, fabricmanager, numa_topology,
+                       rdma_iface, ssh_connectivity, gpu_burn, nvbandwidth, babelstream,
+                       dcgmi, rdma_perf]
+  full: &full [network_mode, nvidia_smi, gpu_topology, fabricmanager, numa_topology,
+               rdma_iface, ssh_connectivity, placement, imex, gpu_burn, nvbandwidth,
+               babelstream, dcgmi, rdma_perf, nccl_allreduce, nccl_alltoall]
+  a10_quick: *quick
+  a10_standard: *standard
+  a10_full: *full
+
+# Budget assumes preinstalled tools; builds and slow/failing hosts add time.
+profile_settings:
+  quick: {burn_duration_s: 120, description: 'About 5 min: preflight + 2 min burn'}
+  standard: {burn_duration_s: 1200, description: 'Preflight + 20 min burn + bandwidth + DCGM r2 + RDMA'}
+  full: {burn_duration_s: 3600, description: '1h burn + DCGM r3 (configurable r4) + multi-host NCCL'}
+
+baseline:
+  tolerance_pct: 20
+  # These values are config defaults, not PDF performance guarantees.
+  tolerance_pct_by_check: {gpu_burn: 10, nccl_allreduce: 20, nccl_alltoall: 20}
+
 
 skus:
   a10:
@@ -18,6 +29,8 @@ skus:
     # Source: https://docs.nvidia.com/deeplearning/tensorrt/support-matrix/index.html
     # 24 GB GDDR6, SM 8.6, no NVSwitch/NVLink between GPUs on this shape
     gpu_count: 4            # configurable: 1-4 via --gpu-count or pick a subset with --tests
+    memory_tolerance_mib: 512
+    numa_cpu_nodes_min: 2
     gpu_count_min: 1        # minimum acceptable (for partial host testing)
     gpu_model_pattern: "A10"
     mem_mib_per_gpu: 23028  # 24 GB = 23028 MiB
@@ -27,173 +40,303 @@ skus:
     imex_capable: false
     nvlink: false
     arch: x86_64
-    # nvbandwidth: A10 has PCIe P2P, not NVLink; lower threshold
-    nvbandwidth_d2d_read_ce_min_gbs: 24   # PCIe Gen4 x16 ~32 GB/s peak, conservative floor
-    # RDMA: BM.GPU.A10.4 has 2x 100 Gb/s CX-6 RoCE NICs
-    # TODO(verify): exact HCA names and per-NIC BW threshold on OCI A10 shape
-    rdma_bw_min_gbps: 90    # 100 Gb/s line rate, expect ~90 Gb/s usable
 
   gb300:
+    memory_tolerance_mib: 512
+    numa_cpu_nodes_min: 2
     gpu_count: 4
     gpu_model_pattern: "GB300"
     mem_mib_per_gpu: 284208
     driver_min: "580"
     cuda_min: "13"
-    nvbandwidth_d2d_read_ce_min_gbs: 9000
     fabricmanager_required: true
     imex_capable: true
     arch: aarch64
   b300:
+    memory_tolerance_mib: 512
+    numa_cpu_nodes_min: 2
     gpu_count: 8
     gpu_model_pattern: "B300"
     mem_mib_per_gpu: 275040
     driver_min: "590"
     cuda_min: "13.1"
-    nvbandwidth_d2d_bidi_min_gbs: 750
     fabricmanager_required: true
     imex_capable: false
     arch: x86_64
 
 network:
+  expected_planes: {single_plane: 1, multiplanar: 4}
   mode: auto  # auto | single_plane | multiplanar
   imds_url: "http://169.254.169.254/opc/v2/host"
   imds_timeout_s: 2
+  fallback_mode: single_plane
   single_plane:
-    a10:
-      # TODO(verify): confirm HCA names from `rdma link` on a live BM.GPU.A10.4 host
-      # OCI A10 shape has 2x Mellanox CX-6 100 Gb/s; exact mlx5_X indices unconfirmed
-      hca_names: []           # empty = discover dynamically from `rdma link` ACTIVE+LINK_UP
-      expected_active_hcas: 2
-      rdma_bw_min_gbps: 90
-      rdma_lat_max_us: 5.0    # TODO(verify)
-    gb300:
-      # Source: BM.GPU.GB300.4_Single_Plane_Asset_handover_manual.pdf
-      # mlx5_4 = eth0 (frontend, skip)
-      hca_names: [mlx5_0, mlx5_1, mlx5_2, mlx5_3, mlx5_5, mlx5_6, mlx5_7, mlx5_8]
-      frontend_hca: mlx5_4
-      expected_active_hcas: 8
-      rdma_bw_min_gbps: 380
-      # TODO(verify): doc says 1.8-1.9 µs but GFAB6 observed 2.75-2.82 µs within-block
-      rdma_lat_rack_max_us: 3.5
-      rdma_lat_cross_rack_max_us: 6.0
-    b300:
-      # Source: NRT B300 singleplanar handover-20261005.pdf
-      # mlx5_6 = eth0 (frontend, skip); gaps at mlx5_2-5, mlx5_15
-      hca_names: [mlx5_0, mlx5_1, mlx5_7, mlx5_8, mlx5_9, mlx5_10, mlx5_11,
-                  mlx5_12, mlx5_13, mlx5_14, mlx5_16, mlx5_17, mlx5_18, mlx5_19, mlx5_20, mlx5_21]
-      frontend_hca: mlx5_6
-      expected_active_hcas: 16
-      rdma_bw_min_gbps: 384
-      rdma_lat_same_switch_max_us: 4.0  # TODO(verify): doc says ~3 µs
+    # Discovered ACTIVE + LINK_UP devices, mapped to netdevs. Optional pins below.
+    # TODO(verify): device count/names on each deployment; README has shape-specific examples.
+    a10: {hca_names: [], expected_active_hcas: 2}
+    gb300: {hca_names: [], expected_active_hcas: 4}
+    b300: {hca_names: [], expected_active_hcas: 8}
   multiplanar:
     # Source: GB300.4_multiplanar_handover_manual_from_PSE.pdf
     # IMDS rdmaFabricData.planes == 4
     vf_rails: [rdma_vf_rail0, rdma_vf_rail1, rdma_vf_rail2, rdma_vf_rail3]
     vrfs:     [vrf_r0, vrf_r1, vrf_r2, vrf_r3]
-    # rail index -> NUMA node
+    # TODO(verify): supplied rail -> NUMA mapping; PDF absent from this checkout.
     numa_map: {"0": 0, "1": 0, "2": 1, "3": 1}
-    rdma_bw_host_min_gbps: 450
-    rdma_bw_gpu_min_gbps: 750   # DataDirect / GPU-memory path
-    rdma_lat_max_us: 5.0        # TODO(verify)
+
+# Example values are calibration aids, not hardware guarantees.
+rdma_perf:
+  timeout_s: 90
+  port: 18515
+  probe_timeout_s: 5
+  ready_attempts: 30
+  ready_interval_s: 0.2
+  bw_args: [-F, -q, '2', --report_gbits, -s, '8388608', -D, '5']
+  lat_args: [-F, -s, '8', -n, '10000']
+  single_plane:
+    ip_family: auto  # auto | inet | inet6; no implicit VRF
+    extra_args: []   # TODO(verify): GID/traffic class against target OCI deployment
+    bw_min_gbps: null
+    lat_max_us: null
+  multiplanar:
+    ip_family: inet6
+    extra_args: [-x, '3', --ipv6, --ipv6-addr]
+    # Supplied PDF examples ~459 Gb/s and 3.8-4.0 us, with wide tolerance.
+    example_bw_gbps: 459
+    example_lat_us: 4.0
+    threshold_source: PDF example
+    bw_min_gbps: 321.3  # 70% of example
+    lat_max_us: 6.0     # 150% of example
+
+placement:
+  rack_max_nodes: 18
+  # Non-OCI inventory override: host: {gmf: rack-id, local_block: block-id}
+  inventory: {}
+
+executor:
+  setup_timeout_s: 120
+  parallelism: 16
+  timeout_s: 15
 
 nccl:
-  allreduce_perf_args: "-b 512K -e 16G -f 2 -g 1 -n 50"
-  alltoall_perf_args: "-b 512K -e 8G -f 2 -g 1 -n 50"
+  timeout_s: 1800
+  args: [-b, 1G, -e, 16G, -f, '2', -g, '1', -n, '50']
+  largest_size_bytes: 17179869184
+  baseline_threshold_pct: 80
+  # Optional example busbw GB/s by exact node count (2/16/32/64/80).
+  # Leave empty until calibrated for the mode, SKU, and requested 16 GiB size.
   single_plane:
-    a10:
-      # A10 uses RoCE (no NVLink between hosts); IB_HCA discovered dynamically
-      # TODO(verify): confirm GID index and TC on OCI A10 RoCE fabric
-      IB_TC: 106              # RoCE v2 DSCP 26 → TC 106 (common OCI default, TODO verify)
-      IB_GID_INDEX: 3
-      IB_QPS_PER_CONNECTION: 1
-      CUMEM_ENABLE: 0
-      NET_GDR_C2C: 0          # A10 has no C2C interconnect
-      # allreduce single-node: limited by PCIe P2P; multi-node: limited by 2x100Gb NIC
-      # TODO(verify): measure on hardware; placeholder thresholds
-      allreduce_1node_min_gbs: 40   # PCIe P2P aggregate floor (very conservative)
-      allreduce_2node_min_gbs: 80   # 2x 100 Gb/s NIC floor
-    gb300:
-      # Source: BM.GPU.GB300.4_Single_Plane_Asset_handover_manual.pdf
-      # Double-== is intentional: HPCX prefix meaning "use only these"
-      IB_HCA: "==mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
-      IB_TC: 41
-      IB_GID_INDEX: 3
-      IB_QPS_PER_CONNECTION: 4
-      MNNVL_ENABLE: 1
-      CUMEM_ENABLE: 1
-      NET_GDR_C2C: 1
-      NVLS_ENABLE: 1
-      DMABUF_ENABLE: 1
-      BUFFSIZE: 16777216
-      # Thresholds (busbw GB/s): source = OCI GB300 README
-      allreduce_1node_min_gbs: 685
-      allreduce_16node_min_gbs: 842
-    b300:
-      # Source: NRT B300 singleplanar handover-20261005.pdf
-      IB_HCA: "=mlx5_0,mlx5_1,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
-      IB_TC: 41
-      IB_GID_INDEX: 3
-      IB_QPS_PER_CONNECTION: 1
-      CUMEM_ENABLE: 0   # B300.8 explicitly requires 0, not 1
-      IB_TIMEOUT: 22
-      NVLINK_UTIL_CENTRIC_SCHED_ENABLE: 1
-      allreduce_1node_min_gbs: 835
-      allreduce_2node_min_gbs: 877
+    env: {}  # NCCL_IB_HCA is discovered on every host; TODO(verify) other tuning
+    mpi_args: []
+    thresholds: {allreduce: null, alltoall: null}
+    example_reference_gbs: {allreduce: {}, alltoall: {}}
   multiplanar:
-    # Source: GB300.4_multiplanar_handover_manual_from_PSE.pdf
-    IB_HCA: "=rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3"
-    IB_TC: 96   # NOTE: 96 not 41 (multiplanar-specific)
-    IB_GID_INDEX: 3
-    MNNVL_ENABLE: 1
-    CUMEM_ENABLE: 1
-    NET_PLUGIN: spcx
-    NET: IB
-    IB_ADAPTIVE_ROUTING: 1
-    topo_file_required: true
-    small_cluster:  # <= 32 nodes
-      IB_QPS_PER_CONNECTION: 16
-      TUNING_VARIANT: final_small_cta16_qps16
-      MIN_CTAS: 16
-    large_cluster:  # > 32 nodes
-      IB_QPS_PER_CONNECTION: 1
-      TUNING_VARIANT: final_large_cta32_qps1
-      MIN_CTAS: 32
-      MAX_CTAS: 32
+    env:
+      NCCL_SOCKET_IFNAME: eth0
+      NCCL_IB_HCA: rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3
+      NCCL_NET_PLUGIN: spcx
+      NCCL_NET: IB
+      NCCL_MNNVL_ENABLE: '1'
+      NCCL_NVLS_ENABLE: '1'
+      NCCL_IB_GID_INDEX: '3'
+      NCCL_IB_TC: '96'
+      NCCL_IB_ADAPTIVE_ROUTING: '1'
+      UCX_NET_DEVICES: eth0
+    mpi_args: [--mca, pml, ucx, --mca, coll, '^hcoll']
+    small_max_nodes: 32
+    small_cluster:
+      NCCL_TUNING_VARIANT: final_small_cta16_qps16
+      NCCL_MIN_CTAS: '16'
+      NCCL_IB_QPS_PER_CONNECTION: '16'
+    large_cluster:
+      NCCL_TUNING_VARIANT: final_large_cta32_qps1
+      NCCL_MIN_CTAS: '32'
+      NCCL_MAX_CTAS: '32'
+      NCCL_IB_QPS_PER_CONNECTION: '1'
+    thresholds: {allreduce: null, alltoall: null}
+    example_reference_gbs: {allreduce: {}, alltoall: {}}
 
-gpu_fryer:
-  duration_s: 120
-  # aarch64 needs explicit nvml lib path; x86 can omit
+imex:
+  nodes_file: /etc/nvidia-imex/nodes_config.cfg
+  service: nvidia-imex
+
+cuda:
+  path: /usr/local/cuda
+
+gpu_burn:
+  backend: gpu-burn  # gpu-burn | gpu-fryer (fryer does not check numerical errors)
+  build_if_missing: true
+  source_dir: tools/gpu-burn
+  repository: https://github.com/wilicc/gpu-burn.git
+  build_timeout_s: 600
+  timeout_margin_s: 60
+  # The next three options apply to gpu-burn; fryer controls its own precision/memory.
+  tensor_core: true
+  double: false
+  memory_percentage: 90
+  gpus: []  # empty = all; otherwise CUDA-visible device indices, e.g. [0, 2]
+  # NVIDIA lists B300 AND GB300 as compute capability 10.3, not 10.0.
+  # https://developer.nvidia.com/cuda-gpus
+  # gpu-burn make expects COMPUTE=103, not sm_103:
+  # https://github.com/wilicc/gpu-burn#building
+  compute_capability: {b300: 103, gb300: 103, a10: 86}
+  perf_deviation_threshold_pct: 10
+  sample_interval_s: 1
+  sample_timeout_s: 10
+  nvml_lib_path: null  # explicit override for any architecture
   nvml_lib_aarch64: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1
 
-dcgm:
-  # r1 = quick health, r3 = extended, r4 = full stress
-  levels: [1, 3, 4]
+babelstream:
+  build_if_missing: true
+  source_dir: tools/BabelStream
+  repository: https://github.com/UoB-HPC/BabelStream.git
+  build_timeout_s: 600
+  build_jobs: 4
+  timeout_s: 300
+  gpus: []  # empty = one invocation per GPU in the SKU
+  # CUDA_ARCH is passed directly to nvcc's -arch, so use sm_103.
+  # https://github.com/UoB-HPC/BabelStream/blob/main/src/cuda/model.cmake
+  # https://developer.nvidia.com/cuda-gpus
+  cuda_arch: {b300: sm_103, gb300: sm_103, a10: sm_86}
+  # Thresholds (GB/s) per SKU, per benchmark type
+  thresholds:
+    b300:
+      copy_min_gbs: 900
+      mul_min_gbs: 900
+      add_min_gbs: 900
+      triad_min_gbs: 900
+      dot_min_gbs: 100
+    gb300:
+      copy_min_gbs: 900
+      mul_min_gbs: 900
+      add_min_gbs: 900
+      triad_min_gbs: 900
+      dot_min_gbs: 100
+    a10:
+      copy_min_gbs: 300
+      mul_min_gbs: 300
+      add_min_gbs: 300
+      triad_min_gbs: 300
+      dot_min_gbs: 50
+
+dcgmi:
+  # https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html
+  profile_levels: {quick: 1, standard: 2, full: 3,
+                   a10_quick: 1, a10_standard: 2, a10_full: 3}
+  # Full can be changed to level 4; diagnostics may take many minutes.
+  timeout_s: 3600
 
 nvbandwidth:
-  # TODO(verify): sm_100 for Blackwell; multiplanar PDF confirms CMAKE patch
-  cuda_arch: sm_100
+  build_if_missing: true
+  source_dir: tools/nvbandwidth
+  repository: https://github.com/NVIDIA/nvbandwidth.git
+  build_timeout_s: 600
+  build_jobs: 4
+  timeout_s: 600
+  cuda_arch: {b300: 103, gb300: 103, a10: 86}
+  # Official multi-node build: cmake -DMULTINODE=1; one MPI rank per GPU.
+  # Requires CUDA >=12.3, driver >=550, MPI and configured IMEX on all hosts.
+  # https://github.com/NVIDIA/nvbandwidth#multi-node-support
+  # Enable explicitly; select multinode_* test names below and pass --nodes.
+  # TODO(verify): GB300 IMEX permissions, host placement, MPI interface binding,
+  # shared binary/CUDA paths and multi-node SUM floors on the target deployment.
+  multinode: false
+  mpi_args: []
   tests:
     a10:
-      # A10 is Ampere (sm_86); PCIe P2P only, no NVLink
-      cuda_arch: sm_86
       test_names: [device_to_device_bidirectional_memcpy_read_ce,
-                   host_to_device_memcpy_ce,
-                   device_to_host_memcpy_ce]
-      # Per-test thresholds (GB/s); key = test_name, value = min GB/s
-      # PCIe Gen4 x16 ~32 GB/s D2D, ~14 GB/s H2D/D2H
+                   host_to_device_memcpy_ce, device_to_host_memcpy_ce]
       thresholds:
         device_to_device_bidirectional_memcpy_read_ce: 20
         host_to_device_memcpy_ce: 10
         device_to_host_memcpy_ce: 10
-    gb300: [device_to_device_bidirectional_memcpy_read_ce]
-    b300:  [device_to_device_bidirectional_memcpy_read_ce,
-            device_to_device_bidirectional_memcpy_write_sm,
-            device_to_device_bidirectional_memcpy_read_sm]
+    gb300:
+      test_names: [device_to_device_bidirectional_memcpy_read_ce]
+      thresholds:
+        # TODO(verify): inherited aggregate SUM floor; calibrate on hardware.
+        device_to_device_bidirectional_memcpy_read_ce: 9000
+    b300:
+      test_names: [device_to_device_bidirectional_memcpy_read_ce,
+                   device_to_device_bidirectional_memcpy_write_sm,
+                   device_to_device_bidirectional_memcpy_read_sm]
+      thresholds:
+        # TODO(verify): inherited floor applies to SUM, not individual links.
+        device_to_device_bidirectional_memcpy_read_ce: 750
 
 tools:
+  git: git
+  make: make
+  cmake: cmake
   ib_write_bw: /usr/bin/ib_write_bw
   ib_write_lat: /usr/bin/ib_write_lat
-  nvbandwidth: ./nvbandwidth
+  nvidia_smi: nvidia-smi
+  gpu-burn: ./tools/gpu-burn/gpu_burn
+  babelstream: ./tools/BabelStream/build/cuda-stream
+  nvbandwidth: ./tools/nvbandwidth/build/nvbandwidth
   gpu_fryer: gpu-fryer
   dcgmi: dcgmi
   mpirun: mpirun
+  timeout: timeout
+  ss: ss
+  ip: ip
+  rdma: rdma
+  numactl: numactl
+  curl: curl
+  allreduce_perf: ./tools/nccl-tests/build/all_reduce_perf
+  alltoall_perf: ./tools/nccl-tests/build/alltoall_perf
+  systemctl: systemctl
+  ssh: ssh
+  hostname: hostname
+  ssh_keygen: ssh-keygen
+  ssh_copy_id: ssh-copy-id
+  ssh_keyscan: ssh-keyscan
+  cat: cat
+
+# Hints follow the supplied manual excerpts; the original PDF is absent.
+# TODO(verify): reconcile these with the deployment's PDF and actual diagnostics.
+troubleshooting:
+  default: ['Inspect the saved raw command output; confirm tool paths, versions, permissions and timeouts.']
+  network_mode:
+    - 'Check IMDS rdmaFabricData.planes: 4 is multiplanar; absent/1 is single-plane. Never infer from shape name.'
+    - 'Compare --network-mode/config override with every target host; fix a wrong plane count before workloads.'
+  nvidia_smi:
+    - 'Check driver loading, GPU enumeration, ECC state and SKU counts; inspect nvidia-smi and kernel Xid errors.'
+  gpu_topology:
+    - 'Inspect nvidia-smi topo -m for missing GPU or NIC rows/columns; confirm PCIe enumeration and RDMA/driver installation.'
+  fabricmanager:
+    - 'Inspect systemctl status/journal for nvidia-fabricmanager and ensure its version matches the driver.'
+  numa_topology:
+    - 'Inspect numactl --hardware; only nodes with CPUs and nonzero memory count. Ignore the GB300 zero-MB nodes.'
+  rdma_iface: &rdma_hints
+    - 'Check rdma link: required devices must be ACTIVE and LINK_UP; unused DOWN/DISABLED entries are normal.'
+    - 'Multiplanar: verify vrf_r0..3 exist and each VF netdev is enslaved to the matching VRF.'
+    - 'Single-plane: check discovered devices and netdev mappings; configure counts/pins for the deployment, without assuming VRF or IPv6.'
+  rdma_link: *rdma_hints
+  rdma_perf: &perf_hints
+    - 'Check server/client raw output, the control port/firewall, device pairing, MTU/GID/address family and per-rail IP routes.'
+    - 'Multiplanar: verify IPv6, GID index 3, VF/VRF binding and the configured NUMA mapping; compare all rails.'
+    - 'Recheck placement and traffic before changing example limits or replacing a known-good baseline.'
+  rdma_bw: *perf_hints
+  rdma_lat: *perf_hints
+  ssh_connectivity:
+    - 'Verify BatchMode SSH, trusted known_hosts and keys from the controller and launcher host to every peer.'
+  gpu_burn:
+    - 'Inspect numerical errors, Xid/ECC events, clocks, temperature, power caps and cooling; a throughput imbalance can indicate throttling.'
+  nvbandwidth:
+    - 'Check the requested test names, CUDA build architecture, peer access/NVLink state and aggregate SUM units; calibrate floors per SKU.'
+  babelstream:
+    - 'Check CUDA device selection, build architecture, memory clocks and MB/s-to-GB/s units; inspect each GPU, not just the average.'
+  dcgmi:
+    - 'Inspect each DCGM test/entity result and warning; check supported diagnostic level, permissions, idle GPUs and DCGM/driver compatibility.'
+  placement: &placement_hints
+    - 'Unexpected GMF: keep jobs of up to 18 hosts inside one customerGpuMemoryFabric; reduce --node-count or correct inventory.'
+    - 'Across racks, prefer GMFs with matching customerLocalBlock; inspect IMDS or inventory when blocks differ.'
+  imex:
+    - 'Check active nvidia-imex and nodes_config.cfg on every selected host; membership must stay within one GMF/rack, never across racks.'
+    - 'Use exact inventory hostnames/IPs and include additional same-rack members in placement.inventory.'
+  nccl_allreduce: &nccl_hints
+    - 'Inspect NCCL/MPI output, all ranks/GPUs, HCA discovery, plugin/UCX availability and mode-specific environment settings.'
+    - 'Check GMF/local-block placement and per-GMF IMEX; compare largest-size in-place and out-of-place busbw with the named threshold source.'
+  nccl_alltoall: *nccl_hints
+  baseline:
+    - 'Use the same SKU, network mode, scale, profile and workload options; inspect regressions before recalibrating on known-good hardware.'

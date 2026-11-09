@@ -1,0 +1,5 @@
+GPU 0: 9500.45 GFlop/s 0 errors (temp 45.2 C, power 250 W)
+GPU 1: 9502.12 GFlop/s 0 errors (temp 46.1 C, power 251 W)
+GPU 2: 9501.89 GFlop/s 0 errors (temp 45.8 C, power 250 W)
+GPU 3: 9499.78 GFlop/s 0 errors (temp 44.9 C, power 249 W)
+Total: 9501.06 GFlop/s

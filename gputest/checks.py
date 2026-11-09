@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import socket
+import math
+import statistics
 
-from gputest import parsers
+from gputest import multihost_checks, parsers
 from gputest.core import Result, RunContext, check
 
 # ---------------------------------------------------------------------------
@@ -20,7 +21,7 @@ def nvidia_smi(ctx: RunContext) -> Result:
     fixture = f"nvidia_smi_{ctx.sku}.txt" if ctx.sku != "gb300" else "nvidia_smi.txt"
 
     rr = ctx.run(
-        ["nvidia-smi",
+        [ctx.config["tools"]["nvidia_smi"],
          "--query-gpu=index,name,driver_version,memory.total,ecc.mode.current",
          "--format=csv,noheader,nounits"],
         mock_fixture=fixture,
@@ -53,7 +54,7 @@ def nvidia_smi(ctx: RunContext) -> Result:
     metrics["gpu_count"] = actual_count
     if expected_count and actual_count != expected_count:
         # For A10 a partial host (1-3 GPUs) is acceptable if within [gpu_count_min, gpu_count]
-        if gpu_count_min is not None and actual_count < gpu_count_min:
+        if gpu_count_min is not None and (actual_count < gpu_count_min or actual_count > expected_count):
             issues.append(
                 f"expected {gpu_count_min}-{expected_count} GPUs, found {actual_count}"
             )
@@ -80,7 +81,7 @@ def nvidia_smi(ctx: RunContext) -> Result:
     # Compute capability (informational)
     cap_fixture = f"nvidia_smi_compute_cap_{ctx.sku}.txt"
     rr2 = ctx.run(
-        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+        [ctx.config["tools"]["nvidia_smi"], "--query-gpu=compute_cap", "--format=csv,noheader"],
         mock_fixture=cap_fixture,
     )
     if rr2.returncode == 0 and rr2.stdout.strip():
@@ -92,7 +93,9 @@ def nvidia_smi(ctx: RunContext) -> Result:
     if mem_expected:
         for g in parsed:
             mem = g.get("memory_total_mib")
-            if mem is not None and abs(mem - mem_expected) > 512:
+            if mem is None:
+                issues.append(f"GPU {g['index']}: memory unavailable")
+            elif abs(mem - mem_expected) > sku["memory_tolerance_mib"]:
                 issues.append(
                     f"GPU {g['index']}: memory {mem} MiB, expected ~{mem_expected} MiB"
                 )
@@ -122,80 +125,34 @@ def nvidia_smi(ctx: RunContext) -> Result:
 
 @check("ssh_connectivity", category="preflight", requires_multi_host=True)
 def ssh_connectivity(ctx: RunContext) -> Result:
-    """
-    Verify passwordless SSH from this host to every node in --nodes, and back.
-
-    Checks required for NCCL / MPI multi-host runs:
-      1. This host → each remote node: `ssh node hostname` succeeds without a password prompt.
-      2. Each remote node → this host: `ssh node ssh <local_hostname> hostname` round-trips.
-      3. known_hosts is pre-populated for all nodes (BatchMode catches missing host keys).
-
-    Reports per-node PASS/FAIL so the user knows exactly which link is broken.
-    Uses `ssh -o BatchMode=yes -o ConnectTimeout=10` so a missing key or
-    password prompt fails immediately rather than hanging.
-    """
-    local_hostname = socket.gethostname()
-    failed: list[str] = []
-    details: list[str] = []
-
-    for node in ctx.nodes:
-        # Forward: this host → node
-        rr = ctx.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-             "-o", "StrictHostKeyChecking=no", node, "hostname"],
-            mock_fixture="ssh_hostname.txt",
-        )
-        if rr.skipped:
-            return Result(name="ssh_connectivity", status="SKIP", message="dry-run")
-        if rr.returncode != 0:
-            failed.append(node)
-            details.append(f"→{node}: FAIL ({rr.stderr.strip()[:120]})")
-            continue
-        details.append(f"→{node}: PASS ({rr.stdout.strip()})")
-
-        # Reverse: node → this host (needed for MPI reverse connections)
-        rr2 = ctx.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-             "-o", "StrictHostKeyChecking=no", node,
-             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-             "-o", "StrictHostKeyChecking=no", local_hostname, "hostname"],
-            mock_fixture="ssh_hostname.txt",
-        )
-        if rr2.returncode != 0:
-            failed.append(f"{node}→{local_hostname}")
-            details.append(
-                f"{node}→{local_hostname}: FAIL ({rr2.stderr.strip()[:120]})"
-            )
-        else:
-            details.append(f"{node}→{local_hostname}: PASS")
-
-    msg = "; ".join(details)
-    if failed:
-        return Result(
-            name="ssh_connectivity",
-            status="FAIL",
-            message=f"SSH broken: {', '.join(failed)} | {msg}",
-            metrics={"failed_links": failed},
-        )
-    return Result(
-        name="ssh_connectivity",
-        status="PASS",
-        message=msg,
-        metrics={"nodes_checked": len(ctx.nodes)},
-    )
+    """Check controller->targets and launcher->peers, in parallel through run()."""
+    tools = ctx.config['tools']
+    jobs = [{'cmd': [tools['hostname']], 'node': n, 'mock_fixture': 'ssh_hostname.txt',
+             'timeout': ctx.config['executor']['timeout_s']} for n in ctx.nodes]
+    jobs += [{'cmd': [tools['ssh'], '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '--', n,
+                      tools['hostname']], 'node': ctx.nodes[0], 'mock_fixture': 'ssh_hostname.txt',
+              'timeout': ctx.config['executor']['timeout_s']} for n in ctx.nodes[1:]]
+    results = ctx.run_parallel(jobs)
+    failed = [job['node'] for job, rr in zip(jobs, results) if rr.returncode]
+    raw = '\n'.join(f'{job["node"]}: {rr.stdout}{rr.stderr}' for job, rr in zip(jobs, results))
+    return Result('ssh_connectivity', 'SKIP' if ctx.dry_run else ('FAIL' if failed else 'PASS'),
+                  'dry-run' if ctx.dry_run else (f'SSH broken: {failed}' if failed else 'controller and launcher SSH OK'),
+                  {'nodes_checked': len(ctx.nodes), 'failed_links': failed}, _raw=raw)
 
 
 @check("fabricmanager", category="preflight", skus=["gb300", "b300"])
 def fabricmanager(ctx: RunContext) -> Result:
     """Check nvidia-fabricmanager service is active (NVSwitch SKUs only)."""
+    if not ctx.sku_config().get("fabricmanager_required", False):
+        return Result("fabricmanager", "SKIP", "not applicable: Fabric Manager is not required")
     rr = ctx.run(
-        ["systemctl", "is-active", "nvidia-fabricmanager"],
+        [ctx.config["tools"]["systemctl"], "is-active", "nvidia-fabricmanager"],
         mock_fixture="fabricmanager_active.txt",
     )
     if rr.skipped:
         return Result(name="fabricmanager", status="SKIP", message="dry-run")
     status = rr.stdout.strip()
-    if status == "active":
+    if status == "active" and rr.returncode == 0:
         return Result(name="fabricmanager", status="PASS", message="active")
     return Result(
         name="fabricmanager",
@@ -208,7 +165,7 @@ def fabricmanager(ctx: RunContext) -> Result:
 @check("numa_topology", category="preflight")
 def numa_topology(ctx: RunContext) -> Result:
     """Verify at least 2 NUMA nodes with CPU + memory are present."""
-    rr = ctx.run(["numactl", "--hardware"], mock_fixture=f"numactl_{ctx.sku}.txt")
+    rr = ctx.run([ctx.config["tools"]["numactl"], "--hardware"], mock_fixture=f"numactl_{ctx.sku}.txt")
     if rr.skipped:
         return Result(name="numa_topology", status="SKIP", message="dry-run")
     if rr.returncode != 0:
@@ -217,144 +174,331 @@ def numa_topology(ctx: RunContext) -> Result:
     nodes = parsers.parse_numactl_hardware(rr.stdout)
     cpu_nodes = [n for n in nodes if n["cpus"] and n["mem_mb"] > 0]
     metrics = {"numa_nodes_total": len(nodes), "numa_nodes_with_cpu": len(cpu_nodes)}
-    if len(cpu_nodes) < 2:
+    if len(cpu_nodes) < ctx.sku_config()["numa_cpu_nodes_min"]:
         return Result(name="numa_topology", status="WARN",
                       message=f"only {len(cpu_nodes)} NUMA node(s) with CPU+memory",
-                      metrics=metrics)
+                      metrics=metrics, _raw=rr.stdout)
     return Result(name="numa_topology", status="PASS",
                   message=f"{len(cpu_nodes)} NUMA nodes with CPU+memory",
-                  metrics=metrics)
+                  metrics=metrics, _raw=rr.stdout)
 
 
 @check("rdma_link", category="preflight")
 def rdma_link(ctx: RunContext) -> Result:
-    """
-    Verify RDMA HCAs are ACTIVE + LINK_UP.
+    """Compatibility alias for the shared device/VRF discovery check."""
+    result = multihost_checks.rdma_iface(ctx)
+    result.name = 'rdma_link'
+    devices = next(iter(result.metrics['devices'].values()), [])
+    result.metrics.update(active_hca_count=len(devices), active_hcas=[d['hca'] for d in devices])
+    return result
 
-    For A10: discovers active HCAs dynamically (no fixed list).
-    For GB300/B300: compares against the expected list in config.yaml.
-    """
-    net_cfg = ctx.network_config()
 
-    fixture = f"rdma_link_{ctx.sku}.txt"
-    rr = ctx.run(["rdma", "link"], mock_fixture=fixture)
-    if rr.skipped:
-        return Result(name="rdma_link", status="SKIP", message="dry-run")
-    if rr.returncode != 0:
-        return Result(name="rdma_link", status="FAIL",
-                      message=f"rdma link exited {rr.returncode}", _raw=rr.stderr)
-
-    active = parsers.parse_rdma_link(rr.stdout)
-    metrics = {"active_hca_count": len(active), "active_hcas": [h["hca"] for h in active]}
-
-    expected_count = net_cfg.get("expected_active_hcas")
-    configured_names = net_cfg.get("hca_names", [])
-
+@check('gpu_topology', category='preflight')
+def gpu_topology(ctx: RunContext) -> Result:
+    rr = ctx.run([ctx.config['tools']['nvidia_smi'], 'topo', '-m'],
+                 mock_fixture=f'gpu_topology_{ctx.sku}.txt')
+    parsed = parsers.parse_gpu_topology(rr.stdout)
+    net = ctx.network_config()
+    expected_nics = len(net['vf_rails']) if ctx.network_mode == 'multiplanar' else net['expected_active_hcas']
     issues = []
+    if rr.returncode:
+        issues.append(f'topology command exited {rr.returncode}')
+    if len(parsed['gpus']) != ctx.sku_config()['gpu_count']:
+        issues.append('missing or unexpected GPU in topology output')
+    if len(parsed['nics']) < expected_nics:
+        issues.append('missing NIC in topology output')
+    return Result('gpu_topology', 'SKIP' if ctx.dry_run else ('FAIL' if issues else 'PASS'),
+                  'dry-run' if ctx.dry_run else ('; '.join(issues) or 'GPU/NIC topology complete'),
+                  parsed, _raw=rr.stdout + rr.stderr)
 
-    if expected_count and len(active) < expected_count:
-        issues.append(
-            f"found {len(active)} active HCA(s), expected {expected_count}"
-        )
 
-    if configured_names:
-        active_names = {h["hca"] for h in active}
-        missing = [n for n in configured_names if n not in active_names]
+def _prepare(ctx, name, section, cmake_flags=()):
+    """Use an installed binary, or clone/build at the configured source path."""
+    import shutil
+    from pathlib import Path
+
+    cfg = ctx.config[section]
+    tool = ctx.config['tools'][name]
+    if ctx.target_node:
+        # Remote binaries are provisioned beforehand; do not inspect/build on the controller.
+        return tool, None
+    installed = shutil.which(tool)
+    if not ctx.mock and installed:
+        return str(Path(installed).resolve()), None
+    if not cfg.get('build_if_missing', False):
+        return tool, None
+    source = Path(cfg['source_dir']).resolve()
+    nvcc = str(Path(ctx.config['cuda']['path']) / 'bin/nvcc')
+    tools = ctx.config['tools']
+    deps = [tools['git'], tools['make'] if section == 'gpu_burn' else tools['cmake'], nvcc]
+    if not ctx.dry_run and not ctx.mock:
+        missing = [d for d in deps if not shutil.which(d)]
         if missing:
-            issues.append(f"HCAs not active: {missing}")
-
-    if issues:
-        return Result(name="rdma_link", status="FAIL",
-                      message="; ".join(issues), metrics=metrics, _raw=rr.stdout)
-
-    return Result(name="rdma_link", status="PASS",
-                  message=f"{len(active)} HCA(s) ACTIVE+LINK_UP",
-                  metrics=metrics)
-
-
-# ---------------------------------------------------------------------------
-# bandwidth
-# ---------------------------------------------------------------------------
-
-@check("nvbandwidth", category="bandwidth")
-def nvbandwidth(ctx: RunContext) -> Result:
-    """
-    Run nvbandwidth memory bandwidth tests.
-
-    Test names and thresholds come from config.yaml per SKU.
-    For A10: PCIe P2P; for GB300/B300: NVLink.
-    """
-    sku_cfg = ctx.sku_config()
-    nb_cfg = ctx.config.get("nvbandwidth", {})
-    sku_nb = nb_cfg.get("tests", {}).get(ctx.sku, {})
-
-    # Resolve test names and threshold
-    if isinstance(sku_nb, dict):
-        test_names = sku_nb.get("test_names", [])
-        # Per-test thresholds dict; fall back to single legacy key
-        thresholds: dict[str, float] = sku_nb.get("thresholds", {})
-        if not thresholds:
-            legacy = sku_nb.get("d2d_read_ce_min_gbs", 0)
-            if legacy:
-                thresholds["device_to_device_bidirectional_memcpy_read_ce"] = legacy
+            return tool, Result(section, 'SKIP', 'missing build tools: ' + ', '.join(missing))
+    commands = []
+    if not source.exists():
+        if not ctx.dry_run and not ctx.mock:
+            source.parent.mkdir(parents=True, exist_ok=True)
+        commands.append([tools['git'], 'clone', '--depth', '1', cfg['repository'], str(source)])
+    if section == 'gpu_burn':
+        arch = str(cfg['compute_capability'][ctx.sku]).removeprefix('sm_')
+        commands.append([tools['make'], '-C', str(source), f'COMPUTE={arch}',
+                         'CUDAPATH=' + ctx.config['cuda']['path']])
     else:
-        # gb300/b300: list of test names, single threshold in sku config
-        test_names = sku_nb if isinstance(sku_nb, list) else []
-        legacy = sku_cfg.get("nvbandwidth_d2d_read_ce_min_gbs", 0)
-        thresholds = {}
-        if legacy:
-            thresholds["device_to_device_bidirectional_memcpy_read_ce"] = legacy
+        commands.extend([
+            [tools['cmake'], '-S', str(source), '-B', str(source / 'build'),
+             '-DCMAKE_CUDA_COMPILER=' + nvcc, *cmake_flags],
+            [tools['cmake'], '--build', str(source / 'build'), '-j', str(cfg['build_jobs'])],
+        ])
+    for cmd in commands:
+        rr = ctx.run(cmd, timeout=cfg['build_timeout_s'], mock_fixture='build.txt')
+        if rr.returncode:
+            return tool, Result(section, 'SKIP' if rr.returncode == 127 else 'FAIL',
+                                f'build command failed: {cmd[0]}: {rr.stderr[-300:]}')
+    return tool, None
 
-    if not test_names:
-        return Result(name="nvbandwidth", status="SKIP",
-                      message=f"no nvbandwidth tests configured for SKU {ctx.sku!r}")
 
-    tool = ctx.config.get("tools", {}).get("nvbandwidth", "./nvbandwidth")
-    fixture = f"nvbandwidth_{ctx.sku}.txt"
+def _command_problem(name, rr):
+    if rr.skipped:
+        return Result(name, 'SKIP', 'dry-run')
+    if rr.returncode == 127:
+        return Result(name, 'SKIP', f'tool unavailable: {rr.stderr.strip()}')
+    if rr.returncode:
+        return Result(name, 'FAIL', f'exited {rr.returncode}: {rr.stderr.strip()[-300:]}',
+                      _raw=rr.stdout + rr.stderr)
+    return None
 
-    metrics: dict = {}
-    issues = []
 
-    for test in test_names:
-        rr = ctx.run([tool, "-t", test], mock_fixture=fixture)
-        if rr.skipped:
-            return Result(name="nvbandwidth", status="SKIP", message="dry-run")
-        if rr.returncode != 0:
-            return Result(name="nvbandwidth", status="FAIL",
-                          message=f"nvbandwidth exited {rr.returncode}: {rr.stderr.strip()[:200]}",
-                          _raw=rr.stdout + rr.stderr)
+@check('gpu_burn', category='burn')
+def gpu_burn(ctx: RunContext) -> Result:
+    """Stress GPUs, retain errors, compare throughput, and sample temperature/power."""
+    from pathlib import Path
 
-        result = parsers.parse_nvbandwidth(rr.stdout, test)
-        gbs = result.get("sum_gbs")
-        metrics[f"{test}_sum_gbs"] = gbs
+    from gputest.core import run_sampled
 
-        floor = thresholds.get(test, 0)
-        if floor and gbs is not None and gbs < floor:
-            issues.append(f"{test}: {gbs:.1f} GB/s < {floor} GB/s")
-
-    if issues:
-        return Result(name="nvbandwidth", status="FAIL",
-                      message="; ".join(issues), metrics=metrics)
-
-    return Result(
-        name="nvbandwidth",
-        status="PASS",
-        message="; ".join(
-            f"{k}={v:.1f} GB/s" for k, v in metrics.items() if v is not None
-        ),
-        metrics=metrics,
+    cfg = ctx.config['gpu_burn']
+    backend = cfg['backend']
+    selection = cfg.get('gpus', [])
+    env = {'CUDA_VISIBLE_DEVICES': ','.join(map(str, selection))} if selection else None
+    cwd = None
+    if backend == 'gpu-burn':
+        tool, problem = _prepare(ctx, 'gpu-burn', 'gpu_burn')
+        if problem:
+            return problem
+        # gpu-burn loads compare.ptx relative to its working directory.
+        cwd = Path(tool).resolve().parent
+        cmd = [str(Path(tool).resolve()), '-m', f"{cfg['memory_percentage']}%"]
+        if cfg['tensor_core']:
+            cmd.append('-tc')
+        if cfg['double']:
+            cmd.append('-d')
+        fixture = 'gpu_burn.txt'
+    elif backend == 'gpu-fryer':
+        cmd = [ctx.config['tools']['gpu_fryer']]
+        if selection:
+            # https://github.com/huggingface/gpu-fryer/blob/main/src/main.rs (Args.gpus)
+            cmd += ['--gpus', ','.join(map(str, selection))]
+        env = None
+        nvml = cfg.get('nvml_lib_path') or cfg.get('nvml_lib_' + ctx.sku_config()['arch'])
+        if nvml:
+            cmd += ['--nvml-lib-path', nvml]
+        fixture = 'gpu_fryer.txt'
+    else:
+        return Result('gpu_burn', 'FAIL', f'unknown backend: {backend}')
+    duration = ctx.burn_duration_s()
+    if ctx.target_node:
+        from pathlib import PurePosixPath
+        remote_path = PurePosixPath(tool if backend == 'gpu-burn' else cmd[0])
+        if backend == 'gpu-burn' and '/' in str(remote_path):
+            cwd = str(remote_path.parent)
+            cmd[0] = './' + remote_path.name
+        else:
+            cwd = None
+    cmd.append(str(duration))
+    rr, samples, sample_error = run_sampled(
+        ctx, cmd, timeout=duration + cfg['timeout_margin_s'],
+        fixture=fixture, cwd=cwd, env=env,
     )
+    problem = _command_problem('gpu_burn', rr)
+    if problem and problem.status == 'SKIP':
+        return problem
+    parsed = parsers.parse_gpu_burn(rr.stdout + '\n' + rr.stderr)
+    gpus = parsed['per_gpu']
+    # wilicc progress vectors follow CUDA_VISIBLE_DEVICES order.
+    if selection and backend == 'gpu-burn':
+        for gpu in gpus:
+            if gpu['gpu_id'] < len(selection):
+                gpu['gpu_id'] = selection[gpu['gpu_id']]
+    expected = len(selection) if selection else ctx.sku_config()['gpu_count']
+    issues = []
+    if problem:
+        issues.append(problem.message)
+    if len(gpus) != expected:
+        issues.append(f'expected {expected} GPU results, parsed {len(gpus)}')
+    if parsed['errors']:
+        issues.append(f"GPU errors detected (counter: {parsed['error_count']})")
+    rates = [g['gflops'] for g in gpus]
+    mean = statistics.mean(rates) if rates else 0
+    for gpu in gpus:
+        deviation = abs(gpu['gflops'] - mean) / mean * 100 if mean > 0 else 100
+        if gpu['gflops'] <= 0 or deviation > cfg['perf_deviation_threshold_pct']:
+            issues.append(f"GPU {gpu['gpu_id']}: throughput deviation {deviation:.1f}%")
+    peaks = parsers.parse_gpu_samples(samples)
+    if selection:
+        peaks = {k: v for k, v in peaks.items() if int(k) in selection}
+    metrics = {'duration_s': duration, 'backend': backend, 'gpu_count': len(gpus), 'per_gpu': gpus,
+               'mean_gflops': mean, 'per_gpu_gflops': rates, 'sampled_peaks': peaks,
+               'numerical_error_check': backend == 'gpu-burn'}
+    for field in ('temp_c', 'power_w'):
+        values = [g[field] for g in peaks.values() if field in g]
+        if values:
+            metrics['peak_' + field] = max(values)
+    if not sample_error and any(
+        field not in peaks.get(str(gpu['gpu_id']), {})
+        for gpu in gpus for field in ('temp_c', 'power_w')
+    ):
+        sample_error = 'temperature/power samples incomplete for tested GPUs'
+    if sample_error:
+        metrics['sampling_warning'] = sample_error
+    status = 'FAIL' if issues else ('WARN' if sample_error else 'PASS')
+    message = '; '.join(issues) or f'{len(gpus)} GPUs, {mean:.0f} mean GFlop/s'
+    if sample_error:
+        message += '; ' + sample_error
+    if backend == 'gpu-fryer':
+        message += '; gpu-fryer does not validate numerical errors'
+    return Result('gpu_burn', status, message, metrics, _raw=rr.stdout + rr.stderr)
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
+@check('nvbandwidth', category='bandwidth')
+def nvbandwidth(ctx: RunContext) -> Result:
+    """Measure configured SUM bandwidths; optionally launch documented MPI tests."""
+    cfg = ctx.config['nvbandwidth']
+    sku = cfg['tests'].get(ctx.sku, {})
+    names = sku.get('test_names', [])
+    if not names:
+        return Result('nvbandwidth', 'SKIP', 'no tests configured for this SKU')
+    multi = cfg.get('multinode', False)
+    if multi and (ctx.sku != 'gb300' or len(ctx.nodes) < 2):
+        return Result('nvbandwidth', 'SKIP', 'multi-node NVLink requires GB300 and >=2 hosts')
+    if any(n.startswith('multinode_') != multi for n in names):
+        return Result('nvbandwidth', 'FAIL', 'test names must match multinode setting')
+    if multi:
+        placed = multihost_checks.placement(ctx)
+        inventory = placed.metrics['inventory']
+        if not ctx.dry_run and len({entry['gmf'] for entry in inventory.values()}) != 1:
+            return Result('nvbandwidth', 'FAIL', 'multi-node NVLink must stay inside one GMF')
+        imex = multihost_checks.imex(ctx, inventory=inventory)
+        if imex.status == 'FAIL':
+            return Result('nvbandwidth', 'FAIL', imex.message, _raw=imex._raw)
+    flags = ['-DCMAKE_CUDA_ARCHITECTURES=' + str(cfg['cuda_arch'][ctx.sku]),
+             '-DMULTINODE=' + ('1' if multi else '0')]
+    tool, problem = _prepare(ctx, 'nvbandwidth', 'nvbandwidth', flags)
+    if problem:
+        return problem
+    metrics, issues, raw = {}, [], []
+    uncalibrated = False
+    for name in names:
+        cmd = [tool, '-t', name]
+        if multi:
+            # https://github.com/NVIDIA/nvbandwidth#multi-node-support
+            # One MPI rank per GPU; IMEX must already be configured on every host.
+            ranks = ctx.sku_config()['gpu_count']
+            cmd = [ctx.config['tools']['mpirun'], '--host', ','.join(ctx.nodes),
+                   '--map-by', f'ppr:{ranks}:node', '-np', str(ranks * len(ctx.nodes)),
+                   *cfg['mpi_args'], *cmd]
+        rr = ctx.run(cmd, timeout=cfg['timeout_s'], mock_fixture=f'nvbandwidth_{ctx.sku}.txt')
+        problem = _command_problem('nvbandwidth', rr)
+        if problem and not ctx.dry_run:
+            return problem
+        if ctx.dry_run:
+            continue
+        raw.append(rr.stdout + rr.stderr)
+        value = parsers.parse_nvbandwidth(rr.stdout, name)['sum_gbs']
+        metrics[name + '_sum_gbs'] = value
+        if name not in sku.get('thresholds', {}):
+            uncalibrated = True
+        if value is None:
+            issues.append(f'{name}: no SUM parsed')
+        elif not math.isfinite(value) or value <= 0 or value < sku.get('thresholds', {}).get(name, 0):
+            issues.append(f'{name}: {value:.1f} GB/s below configured minimum')
+    metrics['uncalibrated'] = uncalibrated
+    return Result('nvbandwidth', 'SKIP' if ctx.dry_run else ('FAIL' if issues else ('WARN' if uncalibrated else 'PASS')),
+                  'dry-run' if ctx.dry_run else ('; '.join(issues) or
+                  ('some SUM thresholds unset' if uncalibrated else 'all SUM thresholds met')),
+                  metrics, _raw='\n'.join(raw))
+
+
+@check('babelstream', category='bandwidth')
+def babelstream(ctx: RunContext) -> Result:
+    """Run CUDA BabelStream separately for each selected GPU."""
+    cfg = ctx.config['babelstream']
+    # https://github.com/UoB-HPC/BabelStream/blob/main/src/cuda/model.cmake
+    flags = ['-DMODEL=cuda', '-DCUDA_ARCH=' + cfg['cuda_arch'][ctx.sku]]
+    tool, problem = _prepare(ctx, 'babelstream', 'babelstream', flags)
+    if problem:
+        return problem
+    devices = cfg.get('gpus') or list(range(ctx.sku_config()['gpu_count']))
+    per_gpu, issues, raw = {}, [], []
+    uncalibrated = False
+    for gpu in devices:
+        rr = ctx.run([tool, '--device', str(gpu)], timeout=cfg['timeout_s'],
+                     mock_fixture=f'babelstream_{ctx.sku}.txt')
+        problem = _command_problem('babelstream', rr)
+        if problem and not ctx.dry_run:
+            return problem
+        if ctx.dry_run:
+            continue
+        raw.append(f'GPU {gpu}\n' + rr.stdout + rr.stderr)
+        benches = parsers.parse_babelstream(rr.stdout)['benchmarks']
+        per_gpu[str(gpu)] = benches
+        for name in ('copy', 'mul', 'add', 'triad', 'dot'):
+            if name + '_min_gbs' not in cfg['thresholds'].get(ctx.sku, {}):
+                uncalibrated = True
+            values = benches.get(name, [])
+            if len(values) != 1:
+                issues.append(f'GPU {gpu} {name}: missing or ambiguous benchmark')
+            elif (not math.isfinite(values[0]) or
+                  values[0] <= 0 or values[0] < cfg['thresholds'].get(ctx.sku, {}).get(name + '_min_gbs', 0)):
+                issues.append(f'GPU {gpu} {name}: {values[0]:.1f} GB/s below minimum')
+    metrics = {'gpu_count': len(per_gpu), 'per_gpu': per_gpu, 'uncalibrated': uncalibrated}
+    for name in ('copy', 'mul', 'add', 'triad', 'dot'):
+        values = [b[name][0] for b in per_gpu.values() if b.get(name)]
+        if values:
+            mean = statistics.mean(values)
+            metrics[name + '_mean_gbs'] = mean
+            metrics[name + '_spread_gbs'] = max(values) - min(values)
+            metrics[name + '_spread_pct'] = (max(values) - min(values)) / mean * 100 if mean else 0
+    return Result('babelstream', 'SKIP' if ctx.dry_run else ('FAIL' if issues else ('WARN' if uncalibrated else 'PASS')),
+                  'dry-run' if ctx.dry_run else ('; '.join(issues) or f'{len(devices)} GPUs benchmarked' + ('; some thresholds unset' if uncalibrated else '')),
+                  metrics, _raw='\n'.join(raw))
+
+
+@check('dcgmi', category='diagnostics')
+def dcgmi(ctx: RunContext) -> Result:
+    """Run profile-selected DCGM JSON diagnostics, retaining individual results."""
+    cfg = ctx.config['dcgmi']
+    profile = ctx.config.get('_profile', 'standard')
+    level = cfg['profile_levels'][profile]
+    rr = ctx.run([ctx.config['tools']['dcgmi'], 'diag', '-r', str(level), '-j'],
+                 timeout=cfg['timeout_s'], mock_fixture=f'dcgmi_r{level}.txt')
+    problem = _command_problem('dcgmi', rr)
+    if problem and problem.status == 'SKIP':
+        return problem
+    parsed = parsers.parse_dcgmi_json(rr.stdout)
+    tests = parsed['tests']
+    metrics = {'level': level, 'tests': tests, 'test_count': len(tests)}
+    metrics.update({s.lower(): sum(t['result'] == s for t in tests)
+                    for s in ('PASS', 'WARN', 'FAIL', 'SKIP')})
+    status = 'FAIL' if problem else parsed['status']
+    message = (problem.message if problem else parsed.get('runtime_error')) or (
+        f"level {level}: {metrics['pass']} passed, {metrics['warn']} warned, "
+        f"{metrics['fail']} failed, {metrics['skip']} skipped")
+    return Result('dcgmi', status, message, metrics, _raw=rr.stdout + rr.stderr)
+
 
 def _version_lt(v1: str, v2: str) -> bool:
-    """True if v1 < v2 by major version number only."""
-    def major(v: str) -> int:
-        try:
-            return int(v.split(".")[0])
-        except (ValueError, IndexError):
-            return 0
-    return major(v1) < major(v2)
+    import re
+    from itertools import zip_longest
+
+    versions = list(zip_longest(re.findall(r'\d+', v1), re.findall(r'\d+', v2), fillvalue='0'))
+    return tuple(int(a) for a, _ in versions) < tuple(int(b) for _, b in versions)

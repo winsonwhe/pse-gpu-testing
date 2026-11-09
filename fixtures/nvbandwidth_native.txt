@@ -1,0 +1,5 @@
+Running device_to_device_memcpy_read_sm.
+memcpy SM GPU(row) -> GPU(column) bandwidth (GB/s)
+SUM device_to_device_memcpy_read_sm 123.45
+Running host_to_device_memcpy_ce.
+SUM host_to_device_memcpy_ce 26.03
