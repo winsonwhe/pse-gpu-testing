@@ -1,0 +1,27 @@
+nvbandwidth Version: 0.5
+Built from Git version: v0.5
+
+NOTE: This tool measures bandwidth over a single-direction stream, not the peak achievable.
+
+Running device_to_device_bidirectional_memcpy_read_ce benchmark
+memcpy CE GPU 0 -> GPU 1: 24.53 GB/s
+memcpy CE GPU 1 -> GPU 0: 24.48 GB/s
+memcpy CE GPU 0 -> GPU 2: 24.51 GB/s
+memcpy CE GPU 2 -> GPU 0: 24.47 GB/s
+memcpy CE GPU 0 -> GPU 3: 24.55 GB/s
+memcpy CE GPU 3 -> GPU 0: 24.50 GB/s
+SUM 24.51 GB/s
+
+Running host_to_device_memcpy_ce benchmark
+memcpy CE HOST -> GPU 0: 12.85 GB/s
+memcpy CE HOST -> GPU 1: 12.83 GB/s
+memcpy CE HOST -> GPU 2: 12.82 GB/s
+memcpy CE HOST -> GPU 3: 12.84 GB/s
+SUM 12.84 GB/s
+
+Running device_to_host_memcpy_ce benchmark
+memcpy CE GPU 0 -> HOST: 13.10 GB/s
+memcpy CE GPU 1 -> HOST: 13.08 GB/s
+memcpy CE GPU 2 -> HOST: 13.07 GB/s
+memcpy CE GPU 3 -> HOST: 13.09 GB/s
+SUM 13.09 GB/s

@@ -1,0 +1,199 @@
+profiles:
+  quick:    [nvidia_smi]
+  standard: [nvidia_smi, fabricmanager, numa_topology, rdma_link, dcgm_r1, gpu_fryer,
+             nvbandwidth, ssh_connectivity, rdma_bw, nccl_allreduce]
+  full:     [nvidia_smi, fabricmanager, numa_topology, rdma_link, wpa_supplicant,
+             dcgm_r1, dcgm_r3, dcgm_r4, gpu_fryer, nvbandwidth, babelstream,
+             ssh_connectivity, rdma_bw, rdma_lat, nccl_allreduce, nccl_alltoall, imex]
+  a10_quick:    [nvidia_smi]
+  a10_standard: [nvidia_smi, numa_topology, rdma_link, dcgm_r1, nvbandwidth,
+                 ssh_connectivity, rdma_bw, nccl_allreduce]
+  a10_full:     [nvidia_smi, numa_topology, rdma_link, dcgm_r1, dcgm_r3, dcgm_r4,
+                 nvbandwidth, babelstream, ssh_connectivity, rdma_bw, rdma_lat,
+                 nccl_allreduce, nccl_alltoall]
+
+skus:
+  a10:
+    # OCI BM.GPU.A10.4: 4x NVIDIA A10 (Ampere, x86_64)
+    # Source: https://docs.nvidia.com/deeplearning/tensorrt/support-matrix/index.html
+    # 24 GB GDDR6, SM 8.6, no NVSwitch/NVLink between GPUs on this shape
+    gpu_count: 4            # configurable: 1-4 via --gpu-count or pick a subset with --tests
+    gpu_count_min: 1        # minimum acceptable (for partial host testing)
+    gpu_model_pattern: "A10"
+    mem_mib_per_gpu: 23028  # 24 GB = 23028 MiB
+    driver_min: "525"
+    cuda_min: "11.8"
+    fabricmanager_required: false  # no NVSwitch on A10
+    imex_capable: false
+    nvlink: false
+    arch: x86_64
+    # nvbandwidth: A10 has PCIe P2P, not NVLink; lower threshold
+    nvbandwidth_d2d_read_ce_min_gbs: 24   # PCIe Gen4 x16 ~32 GB/s peak, conservative floor
+    # RDMA: BM.GPU.A10.4 has 2x 100 Gb/s CX-6 RoCE NICs
+    # TODO(verify): exact HCA names and per-NIC BW threshold on OCI A10 shape
+    rdma_bw_min_gbps: 90    # 100 Gb/s line rate, expect ~90 Gb/s usable
+
+  gb300:
+    gpu_count: 4
+    gpu_model_pattern: "GB300"
+    mem_mib_per_gpu: 284208
+    driver_min: "580"
+    cuda_min: "13"
+    nvbandwidth_d2d_read_ce_min_gbs: 9000
+    fabricmanager_required: true
+    imex_capable: true
+    arch: aarch64
+  b300:
+    gpu_count: 8
+    gpu_model_pattern: "B300"
+    mem_mib_per_gpu: 275040
+    driver_min: "590"
+    cuda_min: "13.1"
+    nvbandwidth_d2d_bidi_min_gbs: 750
+    fabricmanager_required: true
+    imex_capable: false
+    arch: x86_64
+
+network:
+  mode: auto  # auto | single_plane | multiplanar
+  imds_url: "http://169.254.169.254/opc/v2/host"
+  imds_timeout_s: 2
+  single_plane:
+    a10:
+      # TODO(verify): confirm HCA names from `rdma link` on a live BM.GPU.A10.4 host
+      # OCI A10 shape has 2x Mellanox CX-6 100 Gb/s; exact mlx5_X indices unconfirmed
+      hca_names: []           # empty = discover dynamically from `rdma link` ACTIVE+LINK_UP
+      expected_active_hcas: 2
+      rdma_bw_min_gbps: 90
+      rdma_lat_max_us: 5.0    # TODO(verify)
+    gb300:
+      # Source: BM.GPU.GB300.4_Single_Plane_Asset_handover_manual.pdf
+      # mlx5_4 = eth0 (frontend, skip)
+      hca_names: [mlx5_0, mlx5_1, mlx5_2, mlx5_3, mlx5_5, mlx5_6, mlx5_7, mlx5_8]
+      frontend_hca: mlx5_4
+      expected_active_hcas: 8
+      rdma_bw_min_gbps: 380
+      # TODO(verify): doc says 1.8-1.9 µs but GFAB6 observed 2.75-2.82 µs within-block
+      rdma_lat_rack_max_us: 3.5
+      rdma_lat_cross_rack_max_us: 6.0
+    b300:
+      # Source: NRT B300 singleplanar handover-20261005.pdf
+      # mlx5_6 = eth0 (frontend, skip); gaps at mlx5_2-5, mlx5_15
+      hca_names: [mlx5_0, mlx5_1, mlx5_7, mlx5_8, mlx5_9, mlx5_10, mlx5_11,
+                  mlx5_12, mlx5_13, mlx5_14, mlx5_16, mlx5_17, mlx5_18, mlx5_19, mlx5_20, mlx5_21]
+      frontend_hca: mlx5_6
+      expected_active_hcas: 16
+      rdma_bw_min_gbps: 384
+      rdma_lat_same_switch_max_us: 4.0  # TODO(verify): doc says ~3 µs
+  multiplanar:
+    # Source: GB300.4_multiplanar_handover_manual_from_PSE.pdf
+    # IMDS rdmaFabricData.planes == 4
+    vf_rails: [rdma_vf_rail0, rdma_vf_rail1, rdma_vf_rail2, rdma_vf_rail3]
+    vrfs:     [vrf_r0, vrf_r1, vrf_r2, vrf_r3]
+    # rail index -> NUMA node
+    numa_map: {"0": 0, "1": 0, "2": 1, "3": 1}
+    rdma_bw_host_min_gbps: 450
+    rdma_bw_gpu_min_gbps: 750   # DataDirect / GPU-memory path
+    rdma_lat_max_us: 5.0        # TODO(verify)
+
+nccl:
+  allreduce_perf_args: "-b 512K -e 16G -f 2 -g 1 -n 50"
+  alltoall_perf_args: "-b 512K -e 8G -f 2 -g 1 -n 50"
+  single_plane:
+    a10:
+      # A10 uses RoCE (no NVLink between hosts); IB_HCA discovered dynamically
+      # TODO(verify): confirm GID index and TC on OCI A10 RoCE fabric
+      IB_TC: 106              # RoCE v2 DSCP 26 → TC 106 (common OCI default, TODO verify)
+      IB_GID_INDEX: 3
+      IB_QPS_PER_CONNECTION: 1
+      CUMEM_ENABLE: 0
+      NET_GDR_C2C: 0          # A10 has no C2C interconnect
+      # allreduce single-node: limited by PCIe P2P; multi-node: limited by 2x100Gb NIC
+      # TODO(verify): measure on hardware; placeholder thresholds
+      allreduce_1node_min_gbs: 40   # PCIe P2P aggregate floor (very conservative)
+      allreduce_2node_min_gbs: 80   # 2x 100 Gb/s NIC floor
+    gb300:
+      # Source: BM.GPU.GB300.4_Single_Plane_Asset_handover_manual.pdf
+      # Double-== is intentional: HPCX prefix meaning "use only these"
+      IB_HCA: "==mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
+      IB_TC: 41
+      IB_GID_INDEX: 3
+      IB_QPS_PER_CONNECTION: 4
+      MNNVL_ENABLE: 1
+      CUMEM_ENABLE: 1
+      NET_GDR_C2C: 1
+      NVLS_ENABLE: 1
+      DMABUF_ENABLE: 1
+      BUFFSIZE: 16777216
+      # Thresholds (busbw GB/s): source = OCI GB300 README
+      allreduce_1node_min_gbs: 685
+      allreduce_16node_min_gbs: 842
+    b300:
+      # Source: NRT B300 singleplanar handover-20261005.pdf
+      IB_HCA: "=mlx5_0,mlx5_1,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
+      IB_TC: 41
+      IB_GID_INDEX: 3
+      IB_QPS_PER_CONNECTION: 1
+      CUMEM_ENABLE: 0   # B300.8 explicitly requires 0, not 1
+      IB_TIMEOUT: 22
+      NVLINK_UTIL_CENTRIC_SCHED_ENABLE: 1
+      allreduce_1node_min_gbs: 835
+      allreduce_2node_min_gbs: 877
+  multiplanar:
+    # Source: GB300.4_multiplanar_handover_manual_from_PSE.pdf
+    IB_HCA: "=rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3"
+    IB_TC: 96   # NOTE: 96 not 41 (multiplanar-specific)
+    IB_GID_INDEX: 3
+    MNNVL_ENABLE: 1
+    CUMEM_ENABLE: 1
+    NET_PLUGIN: spcx
+    NET: IB
+    IB_ADAPTIVE_ROUTING: 1
+    topo_file_required: true
+    small_cluster:  # <= 32 nodes
+      IB_QPS_PER_CONNECTION: 16
+      TUNING_VARIANT: final_small_cta16_qps16
+      MIN_CTAS: 16
+    large_cluster:  # > 32 nodes
+      IB_QPS_PER_CONNECTION: 1
+      TUNING_VARIANT: final_large_cta32_qps1
+      MIN_CTAS: 32
+      MAX_CTAS: 32
+
+gpu_fryer:
+  duration_s: 120
+  # aarch64 needs explicit nvml lib path; x86 can omit
+  nvml_lib_aarch64: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1
+
+dcgm:
+  # r1 = quick health, r3 = extended, r4 = full stress
+  levels: [1, 3, 4]
+
+nvbandwidth:
+  # TODO(verify): sm_100 for Blackwell; multiplanar PDF confirms CMAKE patch
+  cuda_arch: sm_100
+  tests:
+    a10:
+      # A10 is Ampere (sm_86); PCIe P2P only, no NVLink
+      cuda_arch: sm_86
+      test_names: [device_to_device_bidirectional_memcpy_read_ce,
+                   host_to_device_memcpy_ce,
+                   device_to_host_memcpy_ce]
+      # Per-test thresholds (GB/s); key = test_name, value = min GB/s
+      # PCIe Gen4 x16 ~32 GB/s D2D, ~14 GB/s H2D/D2H
+      thresholds:
+        device_to_device_bidirectional_memcpy_read_ce: 20
+        host_to_device_memcpy_ce: 10
+        device_to_host_memcpy_ce: 10
+    gb300: [device_to_device_bidirectional_memcpy_read_ce]
+    b300:  [device_to_device_bidirectional_memcpy_read_ce,
+            device_to_device_bidirectional_memcpy_write_sm,
+            device_to_device_bidirectional_memcpy_read_sm]
+
+tools:
+  ib_write_bw: /usr/bin/ib_write_bw
+  ib_write_lat: /usr/bin/ib_write_lat
+  nvbandwidth: ./nvbandwidth
+  gpu_fryer: gpu-fryer
+  dcgmi: dcgmi
+  mpirun: mpirun
