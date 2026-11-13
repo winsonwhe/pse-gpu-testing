@@ -1,4 +1,4 @@
-# gpuval: GPU Validation Toolkit
+# gputest: GPU Validation Toolkit
 
 ## Goal
 A small, practical automation tool to validate NVIDIA B300 / GB300 hosts and other GPU shapes (Grace ARM, aarch64; GB300 has multi-host NVLink72).

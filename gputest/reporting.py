@@ -220,7 +220,7 @@ def write_markdown(results, run_meta, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / 'results.md'
-    lines = [f'# gpuval run — {run_meta.get("run_id", "")}', '']
+    lines = [f'# gputest run — {run_meta.get("run_id", "")}', '']
     lines += [f'- **{key}**: {_cell(value)}' for key, value in run_meta.items()]
     lines += ['', '| Check | Status | Summary | Threshold sources |', '|---|---|---|---|']
     for r in results:

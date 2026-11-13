@@ -381,7 +381,7 @@ class TestSshConnectivityCheck:
 class TestSetupSshCli:
     def test_requires_nodes(self, monkeypatch):
         from gputest import cli
-        monkeypatch.setattr(sys, "argv", ["gpuval", "setup-ssh"])
+        monkeypatch.setattr(sys, "argv", ["gputest", "setup-ssh"])
         import pytest as _pt
         with _pt.raises(SystemExit):
             cli.main()
@@ -389,7 +389,7 @@ class TestSetupSshCli:
     def test_dry_run_prints_and_exits_ok(self, monkeypatch, capsys, tmp_path):
         from gputest import cli
         monkeypatch.setattr(sys, "argv",
-                            ["gpuval", "setup-ssh", "--nodes", "n1,n2", "--dry-run"])
+                            ["gputest", "setup-ssh", "--nodes", "n1,n2", "--dry-run"])
         monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
         cli.main()
         out = capsys.readouterr().out

@@ -1,4 +1,4 @@
-# gpuval: GPU validation toolkit
+# gputest: GPU validation toolkit
 
 Validate NVIDIA GB300, B300 and A10 hosts with preflight checks, sustained GPU
 load, memory bandwidth, DCGM, two-host RDMA and multi-host NCCL. Python 3.10+,
@@ -21,6 +21,31 @@ DCGM, numactl, iproute2 (`ip`, `rdma`, `ss`), perftest, GNU `timeout`, and MPI/U
 with SSH support. Build nccl-tests (`all_reduce_perf` and `alltoall_perf`) and configure
 executable paths under `tools` in `config.yaml`. Required versions depend on the
 SKU/deployment; configured minima and performance floors need hardware validation.
+
+### Dependency tools
+
+The project uses a small set of Python and system tools. The links below point to
+their documentation or upstream projects:
+
+| Tool | Purpose | Documentation |
+|---|---|---|
+| [Python](https://docs.python.org/3/) | Runs the CLI and validation checks; Python 3.10 or newer is required. | [Python documentation](https://docs.python.org/3/) |
+| [PyYAML](https://pyyaml.org/wiki/PyYAMLDocumentation) | Loads thresholds, profiles, tool paths and NCCL settings from `config.yaml`. | [PyYAML documentation](https://pyyaml.org/wiki/PyYAMLDocumentation) |
+| [pytest](https://docs.pytest.org/) | Runs the unit and orchestration tests, including CPU-only fixture tests. | [pytest documentation](https://docs.pytest.org/) |
+| [Ruff](https://docs.astral.sh/ruff/) | Checks Python code for lint errors and common style or correctness issues. | [Ruff documentation](https://docs.astral.sh/ruff/) |
+| [NVIDIA Driver](https://docs.nvidia.com/datacenter/tesla/), [CUDA Toolkit](https://docs.nvidia.com/cuda/) | Provides GPU access and CUDA tooling for hardware validation and CUDA-based workloads. | [NVIDIA documentation](https://docs.nvidia.com/) |
+| [NVIDIA Fabric Manager](https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/) | Manages the GPU fabric on supported GB300/B300 systems. | [Fabric Manager guide](https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/) |
+| [DCGM](https://docs.nvidia.com/datacenter/dcgm/latest/) | Runs NVIDIA GPU diagnostics and health checks. | [DCGM documentation](https://docs.nvidia.com/datacenter/dcgm/latest/) |
+| [numactl](https://github.com/numactl/numactl) | Selects NUMA nodes and reports CPU/memory topology for locality checks. | [numactl project](https://github.com/numactl/numactl) |
+| [iproute2](https://www.kernel.org/pub/linux/utils/net/iproute2/) | Provides `ip`, `rdma` and `ss` for interface, VRF and RDMA checks. | [iproute2 releases](https://www.kernel.org/pub/linux/utils/net/iproute2/) |
+| [perftest](https://github.com/linux-rdma/perftest) | Provides `ib_write_bw` and `ib_write_lat` for RDMA bandwidth and latency checks. | [perftest project](https://github.com/linux-rdma/perftest) |
+| [Open MPI](https://www.open-mpi.org/), [UCX](https://openucx.readthedocs.io/) | Launches and transports multi-host NCCL jobs. | [Open MPI](https://www.open-mpi.org/), [UCX documentation](https://openucx.readthedocs.io/) |
+| [nccl-tests](https://github.com/NVIDIA/nccl-tests) | Provides `all_reduce_perf` and `alltoall_perf` for NCCL validation. | [nccl-tests project](https://github.com/NVIDIA/nccl-tests) |
+| [GNU coreutils `timeout`](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html) | Bounds every external command so failed or hung workloads finish predictably. | [timeout manual](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html) |
+
+The mock profile only needs Python, PyYAML and the project test tools. GPU-host
+dependencies are required when running hardware checks for real. `git`, `make`,
+CMake and `nvcc` are also needed when configured benchmark sources must be built.
 
 Local gpu-burn, nvbandwidth and BabelStream can clone/build missing sources when
 `build_if_missing: true`. Git, make/CMake and nvcc must already exist; system
@@ -131,7 +156,7 @@ placement:
 IMEX is GB300-only, checked before NCCL with MNNVL enabled. Existing node files
 must contain the selected same-GMF peers and no cross-rack members; additional
 members need inventory entries. Use exact hostnames/IPs from the IMEX files.
-The service must be active. gpuval validates membership and state; it does not
+The service must be active. gputest validates membership and state; it does not
 install, restart or configure IMEX, or prove transport health. IMEX domains are
 per GMF, never one domain spanning multiple racks.
 
@@ -194,7 +219,7 @@ requires a new baseline. Checks are keyed independently, so saving another
 profile/check adds records at its scope. The same check/scale record is replaced
 by a later successful save. Host positions pair equivalent hosts across runs;
 rail/device and GPU metric names must match. Versioned baseline files from older
-gpuval revisions must be regenerated. Mock baselines are only orchestration tests.
+gputest revisions must be regenerated. Mock baselines are only orchestration tests.
 
 ## Run multi-host NCCL with mpirun
 

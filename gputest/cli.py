@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # Ensure the repo root is on the path so gputest is importable when running
-# as `python -m gputest.cli` or via the `gpuval` wrapper.
+# as `python -m gputest.cli` or via the `gputest` wrapper.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import gputest.checks  # noqa: F401 — registers all checks as side-effect
@@ -132,7 +132,7 @@ def cmd_run(args, config: dict) -> None:
         detection_error = str(exc)
     network_mode = ctx.network_mode
 
-    print(f"gpuval run  sku={args.sku}  profile={args.profile}  "
+    print(f"gputest run  sku={args.sku}  profile={args.profile}  "
           f"network={network_mode}  nodes={nodes or ['localhost']}")
     print(f"Results dir: {results_dir}")
     print()
@@ -252,7 +252,7 @@ def _positive_int(value):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="gpuval",
+        prog="gputest",
         description="GPU validation toolkit for NVIDIA A10 / B300 / GB300 hosts.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
