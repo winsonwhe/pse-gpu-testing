@@ -1,0 +1,2 @@
+Usage: ib_write_bw [options]
+  --use_cuda         use CUDA memory

@@ -1,11 +1,14 @@
 profiles:
-  quick: &quick [network_mode, nvidia_smi, gpu_topology, fabricmanager, numa_topology,
-                  rdma_iface, gpu_burn]
-  standard: &standard [network_mode, nvidia_smi, gpu_topology, fabricmanager, numa_topology,
-                       rdma_iface, ssh_connectivity, gpu_burn, nvbandwidth, babelstream,
-                       dcgmi, rdma_perf]
-  full: &full [network_mode, nvidia_smi, gpu_topology, fabricmanager, numa_topology,
-               rdma_iface, ssh_connectivity, placement, imex, gpu_burn, nvbandwidth,
+  quick: &quick [network_mode, nvidia_smi, kernel_xid, ecc_remap, pcie_link, nvlink,
+                  clocks_throttle, software_versions, gpu_topology, fabricmanager,
+                  numa_topology, rdma_iface, gpudirect_rdma, gpu_burn]
+  standard: &standard [network_mode, nvidia_smi, kernel_xid, ecc_remap, pcie_link, nvlink,
+                       clocks_throttle, software_versions, gpu_topology, fabricmanager,
+                       numa_topology, rdma_iface, gpudirect_rdma, ssh_connectivity, gpu_burn,
+                       nvbandwidth, babelstream, dcgmi, rdma_perf]
+  full: &full [network_mode, nvidia_smi, kernel_xid, ecc_remap, pcie_link, nvlink,
+               clocks_throttle, software_versions, gpu_topology, fabricmanager, numa_topology,
+               rdma_iface, gpudirect_rdma, ssh_connectivity, placement, imex, gpu_burn, nvbandwidth,
                babelstream, dcgmi, rdma_perf, nccl_allreduce, nccl_alltoall]
   a10_quick: *quick
   a10_standard: *standard
@@ -291,6 +294,12 @@ tools:
   ssh_copy_id: ssh-copy-id
   ssh_keyscan: ssh-keyscan
   cat: cat
+  journalctl: journalctl
+  nvcc: nvcc
+  ofed_info: ofed_info
+  ibv_devinfo: ibv_devinfo
+  lsmod: lsmod
+  fabricmanager: nvidia-fabricmanager
 
 # Hints follow the supplied manual excerpts; the original PDF is absent.
 # TODO(verify): reconcile these with the deployment's PDF and actual diagnostics.

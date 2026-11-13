@@ -397,6 +397,13 @@ def run_checks(
                 result = Result(name, status, '; '.join(f'{n}: {r.message}' for n, r in zip(ctx.nodes, host_results)),
                                 {'nodes': ctx.nodes, 'hosts': {n: r.metrics for n, r in zip(ctx.nodes, host_results)}},
                                 _raw='\n'.join(f'{n}: {r.status}\n{r._raw}' for n, r in zip(ctx.nodes, host_results)))
+                if name == 'software_versions':
+                    fingerprints = {n: tuple(sorted(r.metrics.get('versions', {}).items()))
+                                    for n, r in zip(ctx.nodes, host_results)}
+                    if len(set(fingerprints.values())) > 1:
+                        result.status = 'WARN'
+                        result.message += '; software version mismatch across nodes'
+                        result.metrics['version_mismatch'] = fingerprints
                 result.thresholds = [dict(t, host=n) for n, r in zip(ctx.nodes, host_results) for t in r.thresholds]
                 result.hints = list(dict.fromkeys(h for r in host_results for h in r.hints))
                 if all(r.metrics.get('uncalibrated') for r in host_results):

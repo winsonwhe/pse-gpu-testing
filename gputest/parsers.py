@@ -7,6 +7,69 @@ import math
 import re
 
 
+def parse_xid_events(text: str) -> list[dict]:
+    """Parse NVIDIA Xid events from kernel/journal output."""
+    events = []
+    for line in text.splitlines():
+        m = re.search(r'NVRM:\s+Xid\s+\([^)]*\):\s+(\d+)', line)
+        if not m:
+            m = re.search(r'NVRM:\s+Xid\s+\([^)]*\).*?\bXid\s+(\d+)', line)
+        if m:
+            events.append({'code': int(m[1]), 'line': line.strip()})
+    return events
+
+
+def parse_nvidia_smi_key_value(text: str) -> dict:
+    """Parse ``nvidia-smi -q`` indented ``Key : value`` fields."""
+    result = {}
+    for line in text.splitlines():
+        m = re.match(r'\s*([^:]+?)\s*:\s*(.*?)\s*$', line)
+        if m:
+            key = re.sub(r'[^a-z0-9]+', '_', m[1].strip().lower()).strip('_')
+            result.setdefault(key, []).append(m[2])
+    return result
+
+
+def parse_pcie_link(text: str) -> dict:
+    """Parse PCIe link generation/width and AER counters from nvidia-smi output."""
+    result = {'links': [], 'aer': {}}
+    for line in text.splitlines():
+        low = line.lower()
+        m = re.search(r'current\s+link\s+(?:gen|generation)\s*:\s*(\S+)', low)
+        if m:
+            result['links'].append({'generation': m[1]})
+        m = re.search(r'current\s+link\s+width\s*:\s*(\S+)', low)
+        if m and result['links']:
+            result['links'][-1]['width'] = m[1]
+        m = re.search(r'(?:aer|correctable|uncorrectable)[^:]*:\s*(\d+)', low)
+        if m:
+            key = re.sub(r'[^a-z0-9]+', '_', low.split(':', 1)[0]).strip('_')
+            result['aer'][key] = int(m[1])
+    return result
+
+
+def parse_nvlink_status(text: str) -> dict:
+    """Parse nvidia-smi nvlink -s state and error counters."""
+    links = re.findall(r'Link\s+(\d+)\s*:\s*(\w+)', text, re.I)
+    errors = {}
+    for m in re.finditer(r'(?:link\s*)?(\d+)[^\n]*(?:error|errors)\s*[:=]\s*(\d+)', text, re.I):
+        errors[m[1]] = int(m[2])
+    return {'links': [{'index': int(i), 'state': s.upper()} for i, s in links],
+            'active_count': sum(s.upper() in ('UP', 'ACTIVE') for _, s in links),
+            'errors': errors}
+
+
+def parse_version_lines(text: str) -> dict:
+    """Parse simple ``component: version`` inventory output."""
+    result = {}
+    for line in text.splitlines():
+        if ':' in line:
+            key, value = line.split(':', 1)
+            if key.strip() and value.strip():
+                result[key.strip().lower().replace(' ', '_')] = value.strip()
+    return result
+
+
 def parse_nvidia_smi_csv(text: str) -> list[dict]:
     """
     Parse output of:
@@ -164,20 +227,27 @@ def parse_gpu_burn(text: str) -> dict:
 
 
 def parse_gpu_samples(text: str) -> dict:
-    """nvidia-smi index,temperature.gpu,power.draw CSV; unavailable fields stay absent."""
+    """nvidia-smi index,temperature.gpu,power.draw[,throttle] CSV."""
     peaks = {}
     for line in text.splitlines():
         parts = [p.strip() for p in line.split(',')]
-        if len(parts) != 3 or not parts[0].isdigit():
+        if len(parts) not in (3, 4) or not parts[0].isdigit():
             continue
         gpu = peaks.setdefault(parts[0], {})
         for key, value in zip(('temp_c', 'power_w'), parts[1:]):
+            if key == 'power_w' and value.lower().startswith(('no throttle', 'none')):
+                continue
             try:
                 number = float(value)
             except ValueError:
                 continue
             if math.isfinite(number):
                 gpu[key] = max(gpu.get(key, number), number)
+        if len(parts) == 4 and parts[3] and parts[3].lower() not in ('none', 'no throttle'):
+            gpu.setdefault('throttle_reasons', set()).add(parts[3])
+    for gpu in peaks.values():
+        if isinstance(gpu.get('throttle_reasons'), set):
+            gpu['throttle_reasons'] = sorted(gpu['throttle_reasons'])
     return peaks
 
 

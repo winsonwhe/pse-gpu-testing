@@ -1,0 +1,4 @@
+Current Link Gen : 5
+Current Link Width : x16
+AER Correctable : 0
+AER Uncorrectable : 0

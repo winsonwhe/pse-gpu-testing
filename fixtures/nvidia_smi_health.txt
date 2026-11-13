@@ -1,0 +1,7 @@
+Driver Version : 580.159.03
+VBIOS Version : 96.00.5F.00.01
+Uncorrectable ECC : 0
+Correctable ECC : 0
+Retired Pages : 0
+Row Remapper Pending : No
+Row Remapper Failure : No

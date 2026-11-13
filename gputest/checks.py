@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import statistics
 
 from gputest import multihost_checks, parsers
@@ -212,6 +213,137 @@ def gpu_topology(ctx: RunContext) -> Result:
                   parsed, _raw=rr.stdout + rr.stderr)
 
 
+def _diagnostic_result(ctx, name, cmd, fixture, parser=None, *, warn_on=None):
+    """Run a read-only diagnostic and normalize unavailable tools to SKIP."""
+    rr = ctx.run(cmd, timeout=ctx.config.get('diagnostics', {}).get('timeout_s', 30),
+                 mock_fixture=fixture)
+    if rr.skipped:
+        return Result(name, 'SKIP', 'dry-run')
+    if rr.returncode == 127:
+        return Result(name, 'SKIP', f'tool unavailable: {rr.stderr.strip()}', _raw=rr.stderr)
+    if rr.returncode:
+        return Result(name, 'FAIL', f'exited {rr.returncode}: {rr.stderr.strip()[-300:]}',
+                      _raw=rr.stdout + rr.stderr)
+    metrics = parser(rr.stdout) if parser else {}
+    bad = warn_on(metrics) if warn_on else False
+    return Result(name, 'WARN' if bad else 'PASS',
+                  'diagnostic findings detected' if bad else 'no diagnostic findings',
+                  metrics, _raw=rr.stdout + rr.stderr)
+
+
+@check('kernel_xid', category='preflight')
+def kernel_xid(ctx: RunContext) -> Result:
+    """Scan kernel logs for NVIDIA Xid events; codes are retained verbatim."""
+    cmd = [ctx.config['tools'].get('journalctl', 'journalctl'), '-k', '--no-pager', '-b']
+    result = _diagnostic_result(ctx, 'kernel_xid', cmd, 'kernel_log.txt', parsers.parse_xid_events,
+                                warn_on=lambda m: bool(m))
+    events = result.metrics if isinstance(result.metrics, list) else []
+    result.metrics = {'events': events, 'codes': [e['code'] for e in events],
+                      'event_count': len(events)}
+    if events and result.status == 'WARN':
+        result.message = 'NVIDIA Xid events: ' + ', '.join(str(e['code']) for e in events)
+    return result
+
+
+@check('ecc_remap', category='preflight')
+def ecc_remap(ctx: RunContext) -> Result:
+    """Check ECC counters, retired pages and row-remapper pending/failure state."""
+    cmd = [ctx.config['tools']['nvidia_smi'], '-q', '-d', 'ECC,REMAP,RETIRED_PAGES']
+    rr = ctx.run(cmd, mock_fixture='nvidia_smi_health.txt')
+    if rr.skipped:
+        return Result('ecc_remap', 'SKIP', 'dry-run')
+    if rr.returncode == 127:
+        return Result('ecc_remap', 'SKIP', 'nvidia-smi unavailable', _raw=rr.stderr)
+    fields = parsers.parse_nvidia_smi_key_value(rr.stdout)
+    bad_fields, warning_fields = {}, {}
+    for key, values in fields.items():
+        low = ' '.join(values).lower()
+        if any(token in key for token in ('uncorrectable', 'retired', 'pending', 'failure', 'correctable')):
+            numbers = [int(x) for x in re.findall(r'\d+', low)]
+            finding = (numbers and max(numbers) > 0) or any(x in low for x in ('pending', 'failure', 'yes'))
+            if finding:
+                (warning_fields if 'correctable' in key and 'uncorrectable' not in key else bad_fields)[key] = values
+    status = 'FAIL' if bad_fields else ('WARN' if warning_fields else 'PASS')
+    message = ('ECC/row-remap failures detected' if bad_fields else
+               'correctable ECC events detected' if warning_fields else 'ECC and row-remap healthy')
+    return Result('ecc_remap', status, message,
+                  {'fields': fields, 'findings': bad_fields, 'warnings': warning_fields},
+                  _raw=rr.stdout + rr.stderr)
+
+
+@check('pcie_link', category='preflight')
+def pcie_link(ctx: RunContext) -> Result:
+    """Report current PCIe generation/width and AER counters."""
+    cmd = [ctx.config['tools']['nvidia_smi'], '-q', '-d', 'PCI']
+    return _diagnostic_result(ctx, 'pcie_link', cmd, 'nvidia_smi_pcie.txt', parsers.parse_pcie_link,
+                              warn_on=lambda m: any(v > 0 for v in m.get('aer', {}).values()))
+
+
+@check('nvlink', category='preflight', skus=['gb300', 'b300'])
+def nvlink(ctx: RunContext) -> Result:
+    """Check NVLink link state and error counters."""
+    return _diagnostic_result(ctx, 'nvlink', [ctx.config['tools']['nvidia_smi'], 'nvlink', '-s'],
+                              'nvidia_smi_nvlink.txt', parsers.parse_nvlink_status,
+                              warn_on=lambda m: any(v > 0 for v in m.get('errors', {}).values()))
+
+
+@check('clocks_throttle', category='preflight')
+def clocks_throttle(ctx: RunContext) -> Result:
+    """Capture NVIDIA clock throttle reasons for later comparison with burn."""
+    cmd = [ctx.config['tools']['nvidia_smi'],
+           '--query-gpu=index,clocks_throttle_reasons.active', '--format=csv,noheader']
+    return _diagnostic_result(ctx, 'clocks_throttle', cmd, 'nvidia_smi_throttle.txt',
+                              lambda text: {'rows': [line.strip() for line in text.splitlines() if line.strip()]},
+                              warn_on=lambda m: any('none' not in x.lower() and 'no throttle' not in x.lower()
+                                                    for x in m['rows']))
+
+
+@check('software_versions', category='preflight')
+def software_versions(ctx: RunContext) -> Result:
+    """Collect driver/CUDA/VBIOS/NIC/OFED/DCGM/Fabric Manager versions."""
+    commands = [
+        ([ctx.config['tools']['nvidia_smi'], '--query-gpu=driver_version,vbios_version', '--format=csv,noheader'], 'nvidia_smi_health.txt'),
+        ([ctx.config['tools'].get('nvcc', 'nvcc'), '--version'], 'version_nvcc.txt'),
+        ([ctx.config['tools'].get('ofed_info', 'ofed_info'), '-s'], 'version_ofed.txt'),
+        ([ctx.config['tools']['dcgmi'], '--version'], 'version_dcgmi.txt'),
+        ([ctx.config['tools'].get('ibv_devinfo', 'ibv_devinfo'), '--version'], 'version_nic.txt'),
+        ([ctx.config['tools'].get('fabricmanager', 'nvidia-fabricmanager'), '--version'], 'version_fabricmanager.txt'),
+    ]
+    raw, versions, missing = [], {}, []
+    for cmd, fixture in commands:
+        rr = ctx.run(cmd, mock_fixture=fixture)
+        raw.append(rr.stdout + rr.stderr)
+        if rr.skipped:
+            return Result('software_versions', 'SKIP', 'dry-run')
+        if rr.returncode == 127:
+            missing.append(cmd[0]); continue
+        if rr.returncode == 0:
+            versions[cmd[0]] = rr.stdout.strip()
+    status = 'WARN' if missing else 'PASS'
+    return Result('software_versions', status,
+                  ('unavailable: ' + ', '.join(missing)) if missing else 'version inventory collected',
+                  {'versions': versions, 'unavailable': missing}, _raw='\n'.join(raw))
+
+
+@check('gpudirect_rdma', category='rdma')
+def gpudirect_rdma(ctx: RunContext) -> Result:
+    """Verify nvidia-peermem and that perftest exposes CUDA mode."""
+    module = ctx.run([ctx.config['tools'].get('lsmod', 'lsmod')], mock_fixture='lsmod.txt')
+    probe = ctx.run([ctx.config['tools']['ib_write_bw'], '--help'], mock_fixture='ib_write_bw_help.txt')
+    if module.skipped or probe.skipped:
+        return Result('gpudirect_rdma', 'SKIP', 'dry-run')
+    loaded = bool(re.search(r'^nvidia_peermem\b', module.stdout, re.M))
+    supports_cuda = '--use_cuda' in (probe.stdout + probe.stderr)
+    if probe.returncode == 127:
+        return Result('gpudirect_rdma', 'SKIP', 'ib_write_bw unavailable', _raw=probe.stderr)
+    status = 'PASS' if loaded and supports_cuda else 'FAIL'
+    return Result('gpudirect_rdma', status,
+                  'nvidia-peermem loaded and ib_write_bw supports --use_cuda' if status == 'PASS'
+                  else 'GPUDirect RDMA prerequisites missing',
+                  {'nvidia_peermem_loaded': loaded, 'ib_write_bw_use_cuda': supports_cuda},
+                  _raw=module.stdout + probe.stdout + module.stderr + probe.stderr)
+
+
 def _prepare(ctx, name, section, cmake_flags=()):
     """Use an installed binary, or clone/build at the configured source path."""
     import shutil
@@ -277,6 +409,10 @@ def gpu_burn(ctx: RunContext) -> Result:
     from gputest.core import run_sampled
 
     cfg = ctx.config['gpu_burn']
+    # Xid is cumulative in the kernel log. Capture both sides so a pre-existing
+    # event does not get misreported as a burn-induced failure.
+    log_cmd = [ctx.config['tools'].get('journalctl', 'journalctl'), '-k', '--no-pager', '-b']
+    xid_before = ctx.run(log_cmd, mock_fixture='kernel_log.txt')
     backend = cfg['backend']
     selection = cfg.get('gpus', [])
     env = {'CUDA_VISIBLE_DEVICES': ','.join(map(str, selection))} if selection else None
@@ -319,6 +455,12 @@ def gpu_burn(ctx: RunContext) -> Result:
         ctx, cmd, timeout=duration + cfg['timeout_margin_s'],
         fixture=fixture, cwd=cwd, env=env,
     )
+    xid_after = ctx.run(log_cmd, mock_fixture='kernel_log.txt')
+    throttle_rr = ctx.run(
+        [ctx.config['tools']['nvidia_smi'],
+         '--query-gpu=index,clocks_throttle_reasons.active', '--format=csv,noheader'],
+        mock_fixture='nvidia_smi_throttle.txt',
+    )
     problem = _command_problem('gpu_burn', rr)
     if problem and problem.status == 'SKIP':
         return problem
@@ -349,6 +491,31 @@ def gpu_burn(ctx: RunContext) -> Result:
     metrics = {'duration_s': duration, 'backend': backend, 'gpu_count': len(gpus), 'per_gpu': gpus,
                'mean_gflops': mean, 'per_gpu_gflops': rates, 'sampled_peaks': peaks,
                'numerical_error_check': backend == 'gpu-burn'}
+    before_events = parsers.parse_xid_events(xid_before.stdout)
+    after_events = parsers.parse_xid_events(xid_after.stdout)
+    before_counts = {}
+    for event in before_events:
+        before_counts[event['code']] = before_counts.get(event['code'], 0) + 1
+    xid_delta = []
+    remaining = dict(before_counts)
+    for event in after_events:
+        if remaining.get(event['code'], 0):
+            remaining[event['code']] -= 1
+        else:
+            xid_delta.append(event)
+    metrics['xid_before'] = before_events
+    metrics['xid_after'] = after_events
+    metrics['xid_delta'] = xid_delta
+    if xid_delta:
+        issues.append('new kernel Xid event(s): ' + ', '.join(str(e['code']) for e in xid_delta))
+    throttle = {}
+    for line in throttle_rr.stdout.splitlines():
+        fields = [part.strip() for part in line.split(',', 1)]
+        if len(fields) == 2 and fields[1] and 'none' not in fields[1].lower() and 'no throttle' not in fields[1].lower():
+            throttle[fields[0]] = fields[1]
+    if throttle:
+        metrics['throttle_reasons'] = throttle
+        issues.append('clock throttle during burn: ' + str(throttle))
     for field in ('temp_c', 'power_w'):
         values = [g[field] for g in peaks.values() if field in g]
         if values:

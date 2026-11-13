@@ -1,0 +1,2 @@
+nvidia_peermem 16384 0
+nvidia 123456 1 nvidia_peermem
